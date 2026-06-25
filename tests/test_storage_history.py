@@ -38,6 +38,26 @@ def test_get_run_missing_returns_empty(store):
     assert run["picks"] == []
 
 
+def test_save_run_is_idempotent_for_same_date(store):
+    # First run: 3 picks. Re-run same date with a different, smaller set whose
+    # rank->symbol mapping differs -> must REPLACE, not accumulate duplicates.
+    store.save_run("2026-06-25",
+                   [_cand("AAPL", 1, 88.0), _cand("MSFT", 2, 81.0),
+                    _cand("NVDA", 3, 79.0)])
+    store.save_run("2026-06-25",
+                   [_cand("NVDA", 1, 90.0), _cand("AAPL", 2, 70.0)])
+
+    run = store.get_run("2026-06-25")
+    picks = run["picks"]
+    assert [p["ticker"] for p in picks] == ["NVDA", "AAPL"]  # only the re-run
+    assert run["meta"]["pick_count"] == 2
+    # MSFT dropped out -> its per-ticker history point for the date is gone.
+    assert store.get_ticker_history("MSFT") == []
+    # NVDA history reflects the latest run only (one point for the date).
+    nvda = store.get_ticker_history("NVDA")
+    assert [(h["run_date"], h["rank"]) for h in nvda] == [("2026-06-25", 1)]
+
+
 def test_ticker_history_across_runs(store):
     store.save_run("2026-06-23", [_cand("AAPL", 1, 80.0)])
     store.save_run("2026-06-24", [_cand("AAPL", 2, 82.0)])

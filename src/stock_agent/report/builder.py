@@ -97,6 +97,86 @@ def _risk_line(pf) -> str:
     return "  ·  ".join(bits)
 
 
+def _sentiment_line(s) -> str:
+    """Compact social/news sentiment summary for a holding."""
+    if s is None:
+        return ""
+    bits = [f"{s.mention_count} mention" + ("s" if s.mention_count != 1 else "")]
+    if s.mention_count:
+        bits.append(f"avg {s.avg_sentiment:+.2f}")
+    if s.news_count:
+        bits.append(f"{s.news_count} news ({s.avg_news_sentiment:+.2f})")
+    return " · ".join(bits)
+
+
+# Buy/hold/trim signal thresholds (transparent, not financial advice).
+_SIGNAL_STRONG = 70.0
+_SIGNAL_WEAK = 45.0
+_SENT_POS = 55.0
+_SENT_SOFT = 45.0
+_MOM_POS = 0.15
+_MOM_NEG = -0.15
+
+
+def holding_signal(c: ScoredCandidate) -> tuple[str, str]:
+    """A lightweight ADD / HOLD / TRIM / WATCH signal for a held position.
+
+    Combines the blended score, sentiment, and 12-mo momentum into a single
+    actionable label plus a short, explainable reason. Deliberately simple and
+    rule-based — it surfaces *why* so the owner can make the call. Not advice.
+
+    - ADD   — strong score with confirming sentiment/momentum (consider buying)
+    - TRIM  — weak score, or deteriorating momentum *and* soft sentiment
+    - HOLD  — stable; nothing actionable
+    - WATCH — not enough fundamental data to judge; monitor news/sentiment
+    """
+    f = c.fundamentals
+    if f is None or getattr(f, "error", None):
+        return ("WATCH", "limited fundamental data — monitor news & sentiment")
+
+    score = c.final_score
+    sent = c.sentiment_score
+    mom = None
+    if c.factors is not None and getattr(c.factors, "error", None) is None:
+        mom = c.factors.momentum
+
+    pos_sent, soft_sent = sent >= _SENT_POS, sent < _SENT_SOFT
+    pos_mom = mom is not None and mom >= _MOM_POS
+    neg_mom = mom is not None and mom <= _MOM_NEG
+
+    reasons: list[str] = []
+    if score >= _SIGNAL_STRONG:
+        reasons.append(f"strong score {score:.0f}")
+    elif score < _SIGNAL_WEAK:
+        reasons.append(f"weak score {score:.0f}")
+    else:
+        reasons.append(f"score {score:.0f}")
+    if pos_sent:
+        reasons.append("positive sentiment")
+    elif soft_sent:
+        reasons.append("soft sentiment")
+    if pos_mom:
+        reasons.append(f"+{mom * 100:.0f}% momentum")
+    elif neg_mom:
+        reasons.append(f"{mom * 100:.0f}% momentum")
+
+    if score >= _SIGNAL_STRONG and (pos_sent or pos_mom) and not neg_mom:
+        label = "ADD"
+    elif score < _SIGNAL_WEAK or (neg_mom and soft_sent):
+        label = "TRIM"
+    else:
+        label = "HOLD"
+    return (label, ", ".join(reasons))
+
+
+_SIGNAL_COLORS = {
+    "ADD": ("#dcfce7", "#166534"),    # green
+    "HOLD": ("#e5e7eb", "#374151"),   # gray
+    "TRIM": ("#fee2e2", "#991b1b"),   # red
+    "WATCH": ("#fef9c3", "#854d0e"),  # amber
+}
+
+
 class ReportBuilder:
     def __init__(self, top_n: int = 10) -> None:
         self.top_n = top_n
@@ -104,12 +184,16 @@ class ReportBuilder:
     def build(self, ranked: list[ScoredCandidate],
               run_date: Optional[str] = None,
               excluded: Optional[list[ScoredCandidate]] = None,
-              stats: Optional[dict] = None) -> Report:
+              stats: Optional[dict] = None,
+              holdings: Optional[list[ScoredCandidate]] = None) -> Report:
         run_date = run_date or date.today().isoformat()
         picks = ranked[: self.top_n]
+        holdings = holdings or []
         subject = self._subject(picks, run_date)
-        text_body = self._text(picks, run_date, excluded or [], stats or {})
-        html_body = self._html(picks, run_date, excluded or [], stats or {})
+        text_body = self._text(picks, run_date, excluded or [], stats or {},
+                               holdings)
+        html_body = self._html(picks, run_date, excluded or [], stats or {},
+                               holdings)
         return Report(subject=subject, html_body=html_body, text_body=text_body)
 
     def _subject(self, picks: list[ScoredCandidate], run_date: str) -> str:
@@ -121,8 +205,44 @@ class ReportBuilder:
                 f"(top {top.ticker} {top.final_score:.0f}) — {names}")
 
     # ----------------- plain text -----------------
+    def _holdings_text(self, holdings: list[ScoredCandidate]) -> list[str]:
+        lines: list[str] = []
+        lines.append("YOUR HOLDINGS")
+        lines.append("-" * 60)
+        lines.append("Daily tracker for stocks you own — signal is a rule-based "
+                     "cue, not advice.")
+        for c in holdings:
+            label, reason = holding_signal(c)
+            name = (f"  ({c.fundamentals.name})"
+                    if c.fundamentals and c.fundamentals.name else "")
+            lines.append(f"[{label}]  {c.ticker}{name}")
+            f = c.fundamentals
+            price = (f"${f.current_price:.2f}"
+                     if f and f.current_price is not None else "—")
+            lines.append(f"   Score {c.final_score:.0f}/100  "
+                         f"[fundamentals {c.fundamentals_score:.0f} | "
+                         f"sentiment {c.sentiment_score:.0f}"
+                         + ("  | HYPE-GATED" if c.gated else "") + "]"
+                         f"   Price {price}")
+            lines.append(f"   Signal: {label} — {reason}")
+            sline = _sentiment_line(c.sentiment)
+            if sline:
+                lines.append(f"   Sentiment: {sline}")
+            risk = _risk_line(c.factors)
+            if risk:
+                lines.append(f"   Risk: {risk}")
+            if c.news:
+                lines.append("   Recent news:")
+                for n in c.news:
+                    src = f" ({n.source})" if n.source else ""
+                    lines.append(f"     - {n.title}{src}")
+            lines.append("")
+        return lines
+
+    # ----------------- plain text -----------------
     def _text(self, picks: list[ScoredCandidate], run_date: str,
-              excluded: list[ScoredCandidate], stats: dict) -> str:
+              excluded: list[ScoredCandidate], stats: dict,
+              holdings: Optional[list[ScoredCandidate]] = None) -> str:
         lines: list[str] = []
         lines.append(f"DAILY STOCK RECOMMENDATION REPORT — {run_date}")
         lines.append("=" * 60)
@@ -139,8 +259,14 @@ class ReportBuilder:
             )
         lines.append("")
 
+        if holdings:
+            lines.extend(self._holdings_text(holdings))
+
         if not picks:
             lines.append("No candidates cleared the data-quality gate today.")
+        else:
+            lines.append("TODAY'S TOP PICKS")
+            lines.append("-" * 60)
         for c in picks:
             lines.append(f"#{c.rank}  {c.ticker}"
                          + (f"  ({c.fundamentals.name})"
@@ -182,7 +308,8 @@ class ReportBuilder:
 
     # ----------------- HTML -----------------
     def _html(self, picks: list[ScoredCandidate], run_date: str,
-              excluded: list[ScoredCandidate], stats: dict) -> str:
+              excluded: list[ScoredCandidate], stats: dict,
+              holdings: Optional[list[ScoredCandidate]] = None) -> str:
         def esc(s) -> str:
             return html.escape(str(s))
 
@@ -206,9 +333,15 @@ class ReportBuilder:
                 f"{esc(stats.get('news_articles', '?'))} news items</p>"
             )
 
+        if holdings:
+            parts.append(self._holdings_html(holdings))
+
         if not picks:
             parts.append("<p><em>No candidates cleared the data-quality gate "
                          "today.</em></p>")
+        else:
+            parts.append("<h2 style=\"margin:24px 0 4px;border-bottom:2px solid "
+                         "#e5e7eb;padding-bottom:4px;\">Today's top picks</h2>")
 
         for c in picks:
             name = (f" — {esc(c.fundamentals.name)}"
@@ -273,6 +406,56 @@ class ReportBuilder:
             f"<span style=\"color:#666;\">(fundamentals {f_pct:.0f} · "
             f"sentiment {s_pct:.0f})</span></p>"
         )
+
+    @staticmethod
+    def _holdings_html(holdings: list[ScoredCandidate]) -> str:
+        def esc(s) -> str:
+            return html.escape(str(s))
+
+        parts: list[str] = [
+            "<h2 style=\"margin:20px 0 2px;\">Your holdings</h2>",
+            "<p style=\"color:#888;font-size:12px;margin:0 0 8px;\">Daily tracker "
+            "for stocks you own — the signal is a rule-based cue, not advice.</p>",
+        ]
+        for c in holdings:
+            label, reason = holding_signal(c)
+            bg, fg = _SIGNAL_COLORS.get(label, _SIGNAL_COLORS["HOLD"])
+            f = c.fundamentals
+            name = (f" — {esc(f.name)}" if f and f.name else "")
+            price = (f"${f.current_price:.2f}"
+                     if f and f.current_price is not None else "—")
+            badge = (f"<span style=\"background:{bg};color:{fg};padding:2px 8px;"
+                     f"border-radius:4px;font-size:12px;font-weight:700;"
+                     f"margin-left:8px;\">{label}</span>")
+            parts.append(
+                "<div style=\"border:1px solid #e5e7eb;border-left:4px solid "
+                f"{fg};border-radius:8px;padding:12px 16px;margin:10px 0;"
+                "background:#fafafa;\">"
+            )
+            parts.append(f"<h3 style=\"margin:0;\">{esc(c.ticker)}{name}{badge}</h3>")
+            parts.append(
+                "<p style=\"margin:6px 0;font-size:14px;\"><strong>Score "
+                f"{c.final_score:.0f}/100</strong> "
+                f"<span style=\"color:#666;\">(fundamentals "
+                f"{c.fundamentals_score:.0f} · sentiment {c.sentiment_score:.0f})"
+                f"</span> · <span style=\"color:#374151;\">{esc(price)}</span></p>"
+            )
+            parts.append(
+                f"<p style=\"margin:4px 0;color:{fg};font-size:13px;\">"
+                f"<strong>{label}</strong> — {esc(reason)}</p>"
+            )
+            sline = _sentiment_line(c.sentiment)
+            if sline:
+                parts.append("<p style=\"margin:2px 0;color:#6b7280;font-size:12px;"
+                             f"\">Sentiment: {esc(sline)}</p>")
+            risk = _risk_line(c.factors)
+            if risk:
+                parts.append("<p style=\"margin:2px 0;color:#6b7280;font-size:12px;"
+                             f"\">Risk &amp; momentum: {esc(risk)}</p>")
+            if c.news:
+                parts.append(ReportBuilder._news_block(c.news))
+            parts.append("</div>")
+        return "".join(parts)
 
     @staticmethod
     def _news_block(news: list) -> str:

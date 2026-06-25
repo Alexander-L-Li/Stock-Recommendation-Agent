@@ -21,7 +21,8 @@ An autonomous, **free** agent that runs **once daily** as an AWS Lambda. It:
 4. Scores each candidate: **70% fundamentals / 30% sentiment**, with
    fundamentals ranked **sector-relative**, a **hype gate**, and a bounded
    **price risk/momentum tilt**.
-5. Emails a ranked, explainable HTML+text report (SES).
+5. Emails a ranked, explainable HTML+text report (SES), with a dedicated
+   **Your Holdings** tracker section for stocks the owner holds.
 6. Persists a **point-in-time snapshot** of every pick to DynamoDB for a weekly
    **backtest** (forward returns vs SPY).
 
@@ -31,7 +32,7 @@ Long-term horizon, no trading, personal use. Tagline in the report:
 - **Local repo:** `~/StockAgent/stock-recommendation-agent`
 - **GitHub:** `https://github.com/Alexander-L-Li/Stock-Recommendation-Agent` (branch `main`)
 - **Language:** Python 3.14, virtualenv at `.venv/`
-- **Tests:** 135, fully mocked (no network/AWS)
+- **Tests:** 150, fully mocked (no network/AWS)
 
 ---
 
@@ -63,7 +64,7 @@ deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pan
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 135 tests, fully mocked
+tests/                   # 150 tests, fully mocked
 ```
 
 ---
@@ -202,7 +203,15 @@ curl -sL "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/
 ## 8. Storage (storage/dynamo.py)
 
 - Single DynamoDB table `stock-agent`, PAY_PER_REQUEST.
-- Item kinds: `WATCHLIST#`, `RUN#<date>` + `PICK#NNN`, ticker history, snapshots.
+- Item kinds: `WATCHLIST#`, `HOLDINGS#`, `RUN#<date>` + `PICK#<rank>#<symbol>` +
+  `META`, ticker history (`TICKER#<sym>`/`RUN#<date>`), `RUNS` index.
+- **`save_run` is idempotent** — it calls `_clear_run(run_date)` first, deleting
+  any prior `PICK#` rows + per-ticker history for that date before writing. This
+  prevents duplicate-pick accumulation on same-day re-runs (the `PICK#` SK embeds
+  rank+symbol, which shifts run-to-run, so plain puts would NOT overwrite). Keep
+  this — there's a `test_save_run_is_idempotent_for_same_date` regression test.
+- Watchlist + holdings: `add_to_watchlist/remove_from_watchlist/list_watchlist`
+  and `add_holding/remove_holding/list_holdings` (both upper-cased + sorted).
 - `_feature_snapshot(c)` captures fundamentals + sentiment vectors and, when
   `c.factors` is present **and has no error**, a `snap["factors"]` block
   (momentum/volatility/beta/max_drawdown/avg_dollar_volume, non-None only).
@@ -210,6 +219,27 @@ curl -sL "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/
   also rejects non-finite values. Don't regress this (there's a storage test).
 - `entry_price`, `sector`, `market_cap` are promoted to top-level pick fields for
   the backtest.
+
+---
+
+## 8b. Holdings (portfolio tracker)
+
+Lets the owner track stocks they hold with a dedicated daily report section.
+
+- **Storage:** `HOLDINGS` partition (above). CLI: `holdings add/remove/list`
+  (`cli.cmd_holdings`, mirrors watchlist).
+- **Orchestrator:** reads holdings (guarded by `enable_holdings` +
+  `hasattr(store, "list_holdings")`), unions watchlist+holdings into an
+  `always_include` set passed to StockTwits symbol selection and the universe
+  selector so holdings are **always fetched, scored, factored, and news-attached**
+  regardless of rank or social buzz. Builds `holdings_cands` from
+  `{ranked+excluded by ticker}` and passes `holdings=` to the report.
+- **Report:** `report.builder.holding_signal(c) -> (label, reason)` returns
+  **ADD / HOLD / TRIM / WATCH** (thresholds: strong score >=70, weak <45; sentiment
+  pos >=55, soft <45; momentum +/-0.15; strong+confirming -> ADD; weak or
+  (neg-momentum AND soft-sentiment) -> TRIM; no fundamentals -> WATCH). Rendered as
+  a "Your Holdings" section (text + HTML, colored badge) FIRST, before the day's
+  top picks. Toggle: `ENABLE_HOLDINGS`.
 
 ---
 
@@ -237,6 +267,7 @@ curl -sL "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/
 | `MIN_DOLLAR_VOLUME` | 2,000,000 | Liquidity floor; thinner names can't be boosted |
 | `PRICE_BENCHMARK` | SPY | Beta + backtest benchmark |
 | `TOP_N` | 10 | Picks in the report |
+| `ENABLE_HOLDINGS` | true | Render the "Your Holdings" portfolio-tracker section |
 
 All new flags default to enabled in code, so the deployed Lambda picked them up
 without any env changes.
@@ -248,7 +279,7 @@ without any env changes.
 ```bash
 cd ~/StockAgent/stock-recommendation-agent
 
-# Run the full suite (135 tests). PYTHONPATH=src needed for ad-hoc -c imports.
+# Run the full suite (150 tests). PYTHONPATH=src needed for ad-hoc -c imports.
 .venv/bin/python -m pytest -p no:cacheprovider --color=no
 
 # Run a single file
@@ -366,6 +397,15 @@ aws dynamodb query --table-name stock-agent --region us-east-1 \
    - Deployed + verified live: daily invoke `200`, ranked 39 from the S&P 500,
      emailed, ~29s; top pick GOOGL snapshot persisted sector + factors
      (momentum 1.337 / vol 0.308 / beta 1.10). Lambda raised to 600s/1024MB.
+
+4. **Holdings tracker + idempotent save_run** (latest) — dedicated "Your Holdings"
+   report section for owned stocks (always-shown sentiment/news/risk +
+   ADD/HOLD/TRIM/WATCH signal); `holdings` CLI; `HOLDINGS` storage partition;
+   `save_run` made idempotent via `_clear_run`. Also cleaned up 119 duplicate
+   `PICK#` rows + 66 stale per-ticker history rows under `RUN#2026-06-25` left by
+   repeated same-day manual test invocations. **+15 tests (150 total)**. Verified
+   live: NVDA->ADD, AAPL/KO->HOLD, INTC->TRIM render with real data; re-run kept
+   the partition at exactly 40 picks (idempotency holds).
 
 ---
 

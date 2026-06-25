@@ -4,6 +4,7 @@ Commands:
   run            Run the full pipeline now (writes history; emails unless --no-email)
   preview        Run but skip email and persistence; write report to a file
   watchlist add/remove/list
+  holdings add/remove/list   Manage owned stocks tracked daily in the report
   history TICKER Show a ticker's score history
   show DATE      Show a stored run's picks
   backtest       Attribute past picks' forward returns vs SPY (optionally email)
@@ -60,6 +61,20 @@ def cmd_watchlist(args, config: Config) -> int:
     elif args.action == "list":
         tickers = store.list_watchlist()
         print("\n".join(tickers) if tickers else "(watchlist empty)")
+    return 0
+
+
+def cmd_holdings(args, config: Config) -> int:
+    store = _store(config)
+    if args.action == "add":
+        store.add_holding(args.ticker, note=args.note or "")
+        print(f"Added holding {args.ticker.upper()}")
+    elif args.action == "remove":
+        store.remove_holding(args.ticker)
+        print(f"Removed holding {args.ticker.upper()}")
+    elif args.action == "list":
+        tickers = store.list_holdings()
+        print("\n".join(tickers) if tickers else "(no holdings)")
     return 0
 
 
@@ -146,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     wl.add_argument("--note", default="")
     wl.set_defaults(func=cmd_watchlist)
 
+    hold = sub.add_parser("holdings",
+                          help="Manage your holdings (daily portfolio tracker)")
+    hold.add_argument("action", choices=["add", "remove", "list"])
+    hold.add_argument("ticker", nargs="?", default="")
+    hold.add_argument("--note", default="")
+    hold.set_defaults(func=cmd_holdings)
+
     hist = sub.add_parser("history", help="Show a ticker's score history")
     hist.add_argument("ticker")
     hist.add_argument("--limit", type=int, default=30)
@@ -171,8 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "watchlist" and args.action in ("add", "remove") \
-            and not args.ticker:
+    if args.command in ("watchlist", "holdings") \
+            and args.action in ("add", "remove") and not args.ticker:
         print("error: ticker required for add/remove", file=sys.stderr)
         return 2
     config = Config.from_env()

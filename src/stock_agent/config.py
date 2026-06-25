@@ -121,6 +121,12 @@ class Config:
     # --- Report ---
     top_n: int = 10  # number of picks to include in the emailed report
 
+    # --- Holdings (portfolio tracker) ---
+    # When enabled, tickers on the holdings list are always fetched, scored, and
+    # rendered in a dedicated "Your Holdings" section of the report regardless of
+    # rank, so the owner can track sentiment/news/risk and buy/sell signals.
+    enable_holdings: bool = True
+
     @classmethod
     def from_env(cls) -> "Config":
         recipients = _env_list("RECIPIENT_EMAILS", [])
@@ -177,6 +183,7 @@ class Config:
                 "MIN_FUNDAMENTAL_METRICS", cls.min_fundamental_metrics
             ),
             top_n=_env_int("TOP_N", cls.top_n),
+            enable_holdings=_env_bool("ENABLE_HOLDINGS", cls.enable_holdings),
         )
         if not cfg.error_email and cfg.recipient_emails:
             cfg.error_email = cfg.recipient_emails[0]

@@ -86,13 +86,13 @@ src/stock_agent/
   universe_data.py       # vendored S&P 500 constituents
   orchestrator.py        # wires the pipeline; build_default() for production
   lambda_handler.py      # daily entry point + weekly backtest_handler + error alerting
-  cli.py                 # local CLI + watchlist management + backtest
+  cli.py                 # local CLI + watchlist/holdings management + backtest
 infra/template.yaml      # SAM template (Lambda + EventBridge + DynamoDB + alarm/SNS)
 deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pandas)
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup (email yourself)
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 135 tests, fully mocked (no network/AWS)
+tests/                   # 150 tests, fully mocked (no network/AWS)
 ```
 
 ## Quick start (local)
@@ -121,6 +121,13 @@ aws dynamodb create-table --table-name stock-agent \
 # Manage your watchlist
 python -m stock_agent.cli watchlist add NVDA
 python -m stock_agent.cli watchlist list
+
+# Track stocks you own — they always get a dedicated "Your Holdings" section
+# in the daily report (sentiment, news, risk, and a buy/hold/trim signal).
+python -m stock_agent.cli holdings add NVDA
+python -m stock_agent.cli holdings add AAPL
+python -m stock_agent.cli holdings list
+python -m stock_agent.cli holdings remove AAPL
 
 # Preview a report without emailing/persisting (writes report.html)
 python -m stock_agent.cli preview --open
@@ -163,6 +170,7 @@ runs locally and in Lambda. Key variables:
 | `MIN_DOLLAR_VOLUME` | 2,000,000 | Liquidity floor ($/day); thinner names can't be boosted |
 | `PRICE_BENCHMARK` | SPY | Benchmark for beta and backtest excess return |
 | `TOP_N` | 10 | Picks in the report |
+| `ENABLE_HOLDINGS` | true | Render a dedicated "Your Holdings" tracker section |
 
 ## Cost
 
@@ -195,6 +203,13 @@ SENDER_EMAIL=you@example.com RECIPIENT_EMAILS=you@example.com \
   if it exceeds the Lambda zip limit). VADER is the guaranteed-free MVP.
 - **Watchlist** — managed via the CLI (`watchlist add/remove/list`) against
   DynamoDB; no code edits needed.
+- **Holdings (portfolio tracker)** — managed via the CLI
+  (`holdings add/remove/list`). Held tickers are *always* analyzed and rendered
+  in a dedicated **Your Holdings** section of the report — current price, blended
+  score, social/news sentiment, risk & momentum, recent headlines, and a
+  rule-based **ADD / HOLD / TRIM / WATCH** signal (`report.builder.holding_signal`)
+  with a short reason — regardless of whether they rank in the day's top picks.
+  Toggle with `ENABLE_HOLDINGS`. The signal is a transparent cue, not advice.
 
 ## Performance backtesting & track record
 

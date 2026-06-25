@@ -34,12 +34,16 @@ class FakeFetcher:
 
 
 class FakeStore:
-    def __init__(self, watchlist=None):
+    def __init__(self, watchlist=None, holdings=None):
         self._watchlist = watchlist or []
+        self._holdings = holdings or []
         self.saved = []
 
     def list_watchlist(self):
         return list(self._watchlist)
+
+    def list_holdings(self):
+        return list(self._holdings)
 
     def save_run(self, run_date, candidates, meta=None):
         self.saved.append((run_date, candidates, meta))
@@ -324,3 +328,45 @@ def test_factor_fetch_failure_does_not_break_run():
     result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
     assert result.ranked_count >= 1
     assert "AAPL" in result.report.text_body
+
+
+# --- Holdings (portfolio tracker) feature ---
+def test_holding_is_force_included_and_rendered_even_without_buzz():
+    from stock_agent.universe import FixedUniverse
+
+    config = Config(max_candidates=6)
+    orch = _build(config)
+    # MU is held but never mentioned socially and (deliberately) not in the index.
+    orch.store = FakeStore(holdings=["MU"])
+    orch.universe = FixedUniverse(["AAPL", "NVDA", "MSFT", "KO", "JNJ", "XOM"])
+    orch.fundamentals._mapping["MU"] = Fundamentals(
+        ticker="MU", revenue_growth=0.18, earnings_growth=0.25,
+        profit_margin=0.20, roe=0.18, debt_to_equity=0.4, trailing_pe=15.0,
+        free_cash_flow=2e9, current_price=110.0, sector="Technology",
+        name="Micron")
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+
+    # Held name is analyzed despite no social mention and off-index status.
+    assert "MU" in result.candidates
+    # Dedicated holdings section renders it.
+    assert "YOUR HOLDINGS" in result.report.text_body
+    assert "MU" in result.report.text_body
+    assert "Your holdings" in result.report.html_body
+
+
+def test_holding_with_no_fundamentals_shows_watch():
+    config = Config(max_candidates=6)
+    orch = _build(config)
+    orch.store = FakeStore(holdings=["ZZZZ"])  # no fundamentals provided -> error
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    # It still appears in the holdings section with a WATCH signal.
+    assert "ZZZZ" in result.report.text_body
+    assert "[WATCH]" in result.report.text_body
+
+
+def test_holdings_disabled_by_config_skips_section():
+    config = Config(enable_holdings=False)
+    orch = _build(config)
+    orch.store = FakeStore(holdings=["AAPL"])
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    assert "YOUR HOLDINGS" not in result.report.text_body

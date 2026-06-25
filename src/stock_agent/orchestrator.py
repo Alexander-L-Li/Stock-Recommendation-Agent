@@ -121,13 +121,21 @@ class Orchestrator:
         run_date = run_date or date.today().isoformat()
         logger.info("Starting run for %s", run_date)
 
-        # 1. Watchlist (drives both discovery and StockTwits symbol selection)
+        # 1. Watchlist + holdings (both always analyzed; holdings also get a
+        #    dedicated report section). They drive discovery and StockTwits
+        #    symbol selection too.
         watchlist = self.store.list_watchlist() if self.store else []
+        holdings = []
+        if (self.store is not None and self.config.enable_holdings
+                and hasattr(self.store, "list_holdings")):
+            holdings = self.store.list_holdings()
+        # Names that must always be analyzed regardless of social/universe.
+        always_include = list(dict.fromkeys(list(watchlist) + list(holdings)))
 
         # 2. Collect social sources (Reddit + StockTwits) and news.
         reddit_posts = self.reddit.collect() if self.reddit is not None else []
         stocktwits_posts = (
-            self.stocktwits.collect(watchlist=watchlist)
+            self.stocktwits.collect(watchlist=always_include)
             if self.stocktwits is not None else []
         )
         social_posts = list(reddit_posts) + list(stocktwits_posts)
@@ -147,23 +155,23 @@ class Orchestrator:
             mention_counts = self.extractor.count_mentions(texts)
             candidates = self.universe.select(
                 mention_counts=mention_counts,
-                watchlist=watchlist,
+                watchlist=always_include,
                 max_candidates=self.config.max_candidates,
                 run_date=run_date,
             )
             logger.info("Universe: %d candidates from fixed index of %d "
-                        "(%d socially-mentioned, %d watchlist)",
+                        "(%d socially-mentioned, %d always-include)",
                         len(candidates), len(self.universe),
                         sum(1 for t in candidates if mention_counts.get(t, 0) > 0),
-                        len(watchlist))
+                        len(always_include))
         else:
             candidates, _counts = self.extractor.discover(
-                social_posts, articles, watchlist=watchlist,
+                social_posts, articles, watchlist=always_include,
                 min_mentions=self.config.min_mentions,
                 max_candidates=self.config.max_candidates,
             )
-            logger.info("Discovered %d candidates (%d from watchlist)",
-                        len(candidates), len(watchlist))
+            logger.info("Discovered %d candidates (%d always-include)",
+                        len(candidates), len(always_include))
 
         # 4. Sentiment (Reddit + StockTwits aggregate as one social signal)
         sentiment = {}
@@ -185,8 +193,19 @@ class Orchestrator:
         ranked, excluded = self.engine.rank(fundamentals, sentiment, factors)
         logger.info("Ranked %d, excluded %d", len(ranked), len(excluded))
 
-        # 6b. Attach recent, stock-specific news to the picks that will be shown.
-        self._attach_news(ranked[: self.config.top_n], articles)
+        # 6b. Build the holdings view (always shown, regardless of rank) and
+        #     attach recent stock-specific news to every card that will be
+        #     rendered (top picks + holdings).
+        by_ticker = {c.ticker: c for c in list(ranked) + list(excluded)}
+        holdings_cands = [by_ticker[t] for t in holdings if t in by_ticker]
+        top_picks = ranked[: self.config.top_n]
+        shown = list(top_picks)
+        shown_tickers = {c.ticker for c in top_picks}
+        for c in holdings_cands:
+            if c.ticker not in shown_tickers:
+                shown.append(c)
+                shown_tickers.add(c.ticker)
+        self._attach_news(shown, articles)
 
         # 7. Report
         stats = {
@@ -197,7 +216,8 @@ class Orchestrator:
             "news_articles": len(articles),
         }
         report = self.report_builder.build(
-            ranked, run_date=run_date, excluded=excluded, stats=stats
+            ranked, run_date=run_date, excluded=excluded, stats=stats,
+            holdings=holdings_cands,
         )
 
         # 8. Persist history

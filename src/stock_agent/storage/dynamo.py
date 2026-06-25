@@ -4,6 +4,8 @@ Table ``stock-agent`` layout:
 
   Watchlist items
     PK = "WATCHLIST"          SK = "TICKER#<symbol>"
+  Holdings items (portfolio the owner tracks daily)
+    PK = "HOLDINGS"           SK = "TICKER#<symbol>"
   Run history picks
     PK = "RUN#<date>"         SK = "PICK#<rank:03d>#<symbol>"
   Run metadata summary
@@ -57,6 +59,7 @@ def _from_dynamo(value: Any) -> Any:
 
 
 WATCHLIST_PK = "WATCHLIST"
+HOLDINGS_PK = "HOLDINGS"
 RUNS_INDEX_PK = "RUNS"
 
 
@@ -170,11 +173,73 @@ class Store:
         )
         return sorted(item["ticker"] for item in resp.get("Items", []))
 
+    # ----- holdings (portfolio tracker) -----
+    def add_holding(self, ticker: str, note: str = "") -> None:
+        """Add a ticker the owner holds. Always tracked in the daily report."""
+        ticker = ticker.strip().upper()
+        if not ticker:
+            raise ValueError("ticker must be non-empty")
+        self.table.put_item(
+            Item={
+                "PK": HOLDINGS_PK,
+                "SK": f"TICKER#{ticker}",
+                "ticker": ticker,
+                "note": note,
+            }
+        )
+
+    def remove_holding(self, ticker: str) -> None:
+        ticker = ticker.strip().upper()
+        self.table.delete_item(
+            Key={"PK": HOLDINGS_PK, "SK": f"TICKER#{ticker}"}
+        )
+
+    def list_holdings(self) -> list[str]:
+        resp = self.table.query(
+            KeyConditionExpression=Key("PK").eq(HOLDINGS_PK)
+            & Key("SK").begins_with("TICKER#")
+        )
+        return sorted(item["ticker"] for item in resp.get("Items", []))
+
     # ----- run history -----
+    def _clear_run(self, run_date: str) -> None:
+        """Delete a date's existing PICK rows + per-ticker index entries.
+
+        Makes :meth:`save_run` idempotent: re-running the pipeline for the same
+        date overwrites that date cleanly instead of accumulating duplicate
+        ``PICK#<rank>#<symbol>`` rows (the rank->symbol mapping shifts between
+        runs, so plain put_item would not overwrite the old rows)."""
+        resp = self.table.query(
+            KeyConditionExpression=Key("PK").eq(f"RUN#{run_date}")
+            & Key("SK").begins_with("PICK#")
+        )
+        picks = resp.get("Items", [])
+        while "LastEvaluatedKey" in resp:
+            resp = self.table.query(
+                KeyConditionExpression=Key("PK").eq(f"RUN#{run_date}")
+                & Key("SK").begins_with("PICK#"),
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            picks.extend(resp.get("Items", []))
+        if not picks:
+            return
+        with self.table.batch_writer() as batch:
+            for p in picks:
+                batch.delete_item(Key={"PK": p["PK"], "SK": p["SK"]})
+                # Drop the matching per-ticker history entry for this date so a
+                # ticker that drops out of the run doesn't leave a stale point.
+                batch.delete_item(
+                    Key={"PK": f"TICKER#{p['ticker']}", "SK": f"RUN#{run_date}"}
+                )
+
     def save_run(self, run_date: str, candidates: list[ScoredCandidate],
                  meta: Optional[dict] = None) -> None:
         """Persist a full run: a META summary item plus one item per pick,
-        and a per-ticker index entry for trend queries."""
+        and a per-ticker index entry for trend queries.
+
+        Idempotent: any prior picks for ``run_date`` are cleared first so a
+        same-day re-run replaces rather than duplicates them."""
+        self._clear_run(run_date)
         with self.table.batch_writer() as batch:
             summary = {
                 "run_date": run_date,
