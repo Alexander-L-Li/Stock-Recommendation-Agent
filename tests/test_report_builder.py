@@ -1,6 +1,11 @@
 from stock_agent.report.builder import ReportBuilder
 from stock_agent.scoring.engine import ScoringEngine
-from stock_agent.models import Fundamentals, ScoredCandidate, SentimentResult
+from stock_agent.models import (
+    Fundamentals,
+    NewsRef,
+    ScoredCandidate,
+    SentimentResult,
+)
 
 
 def _scored():
@@ -89,3 +94,43 @@ def test_empty_picks_handled():
     assert "no qualifying picks" in report.subject.lower()
     assert "Excluded" in report.html_body
     assert "X" in report.text_body
+
+
+def _pick_with_news():
+    eng = ScoringEngine()
+    c = eng.score_candidate(
+        "AAPL",
+        Fundamentals(ticker="AAPL", revenue_growth=0.15, earnings_growth=0.20,
+                     profit_margin=0.25, roe=0.30, debt_to_equity=0.4,
+                     free_cash_flow=1e11, trailing_pe=28.0, peg_ratio=1.5,
+                     current_price=190.0, target_mean_price=210.0,
+                     market_cap=3.0e12, sector="Technology", name="Apple Inc."),
+        SentimentResult(ticker="AAPL", mention_count=12, avg_sentiment=0.4),
+    )
+    c.rank = 1
+    c.news = [
+        NewsRef(title="Apple unveils new chip", source="Reuters",
+                url="https://example.com/a"),
+        NewsRef(title="Analysts raise Apple target", source="Bloomberg",
+                url="https://example.com/b"),
+    ]
+    return c
+
+
+def test_key_stats_header_present():
+    report = ReportBuilder().build([_pick_with_news()], run_date="2026-06-25")
+    # Headline strip surfaces sector, price, cap, upside.
+    assert "Technology" in report.html_body
+    assert "Technology" in report.text_body
+    assert "to target" in report.html_body  # upside vs analyst target
+    assert "$3.00T cap" in report.text_body
+
+
+def test_recent_news_rendered_with_links():
+    report = ReportBuilder().build([_pick_with_news()], run_date="2026-06-25")
+    assert "Recent news" in report.html_body
+    assert "Apple unveils new chip" in report.html_body
+    assert "https://example.com/a" in report.html_body  # linked
+    # Plain-text variant lists the headline too.
+    assert "Recent news" in report.text_body
+    assert "Apple unveils new chip" in report.text_body

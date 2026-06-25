@@ -16,6 +16,7 @@ be queried directly without scanning every run.
 """
 from __future__ import annotations
 
+import math
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -26,8 +27,15 @@ from ..models import ScoredCandidate
 
 
 def _to_dynamo(value: Any) -> Any:
-    """Recursively convert floats to Decimal (DynamoDB has no float type)."""
+    """Recursively convert floats to Decimal (DynamoDB has no float type).
+
+    Non-finite floats (NaN / +/-Inf) are dropped to ``None`` because DynamoDB
+    rejects them; this guards the point-in-time snapshot against the occasional
+    bad value from an upstream data source.
+    """
     if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
         # str() round-trips cleanly into Decimal without binary float noise.
         return Decimal(str(value))
     if isinstance(value, dict):
@@ -49,6 +57,46 @@ def _from_dynamo(value: Any) -> Any:
 
 
 WATCHLIST_PK = "WATCHLIST"
+RUNS_INDEX_PK = "RUNS"
+
+
+def _feature_snapshot(c: ScoredCandidate) -> dict:
+    """Capture the point-in-time raw feature vector used to score a pick.
+
+    Persisting the as-of inputs (not just the output scores) makes every
+    recommendation auditable and is a prerequisite for an honest, look-ahead-free
+    backtest: the backtest reads ``entry_price`` recorded here rather than
+    re-fetching (potentially restated) fundamentals later.
+    """
+    snap: dict[str, Any] = {}
+    f = c.fundamentals
+    if f is not None:
+        fundamentals = {
+            "revenue_growth": f.revenue_growth,
+            "earnings_growth": f.earnings_growth,
+            "profit_margin": f.profit_margin,
+            "roe": f.roe,
+            "debt_to_equity": f.debt_to_equity,
+            "free_cash_flow": f.free_cash_flow,
+            "trailing_pe": f.trailing_pe,
+            "peg_ratio": f.peg_ratio,
+            "price_to_book": f.price_to_book,
+            "market_cap": f.market_cap,
+            "current_price": f.current_price,
+            "target_mean_price": f.target_mean_price,
+        }
+        # Drop missing metrics to keep the item compact.
+        snap["fundamentals"] = {k: v for k, v in fundamentals.items()
+                                if v is not None}
+    s = c.sentiment
+    if s is not None:
+        snap["sentiment"] = {
+            "mention_count": s.mention_count,
+            "avg_sentiment": s.avg_sentiment,
+            "news_count": s.news_count,
+            "avg_news_sentiment": s.avg_news_sentiment,
+        }
+    return snap
 
 
 class Store:
@@ -129,6 +177,7 @@ class Store:
                 )
             )
             for c in candidates:
+                f = c.fundamentals
                 pick_item = {
                     "PK": f"RUN#{run_date}",
                     "SK": f"PICK#{c.rank:03d}#{c.ticker}",
@@ -142,7 +191,15 @@ class Store:
                     "rationale": c.rationale,
                     "supporting_signals": c.supporting_signals,
                     "risks": c.risks,
+                    # Point-in-time anchors for backtesting (#2).
+                    "sector": (f.sector if f else None),
+                    "market_cap": (f.market_cap if f else None),
+                    "snapshot": _feature_snapshot(c),
                 }
+                # entry_price is the as-of price the forward return is measured
+                # from; only store it when known so the backtest can rely on it.
+                if f is not None and f.current_price is not None:
+                    pick_item["entry_price"] = f.current_price
                 batch.put_item(Item=_to_dynamo(pick_item))
                 # Per-ticker history index (compact).
                 batch.put_item(
@@ -159,6 +216,17 @@ class Store:
                         }
                     )
                 )
+            # Run-date index so the backtest can enumerate runs without scanning.
+            batch.put_item(
+                Item=_to_dynamo(
+                    {
+                        "PK": RUNS_INDEX_PK,
+                        "SK": f"RUN#{run_date}",
+                        "run_date": run_date,
+                        "pick_count": len(candidates),
+                    }
+                )
+            )
 
     def get_run(self, run_date: str) -> dict:
         """Return {"meta": {...}, "picks": [...]} for a given run date."""
@@ -186,3 +254,17 @@ class Store:
             Limit=limit,
         )
         return [_from_dynamo(i) for i in resp.get("Items", [])]
+
+    def list_run_dates(self, limit: int = 400) -> list[str]:
+        """Return stored run dates, most recent first.
+
+        Backed by the ``RUNS`` index written in :meth:`save_run`. Only runs
+        saved after the point-in-time snapshot upgrade appear here.
+        """
+        resp = self.table.query(
+            KeyConditionExpression=Key("PK").eq(RUNS_INDEX_PK)
+            & Key("SK").begins_with("RUN#"),
+            ScanIndexForward=False,
+            Limit=limit,
+        )
+        return [i["run_date"] for i in resp.get("Items", [])]

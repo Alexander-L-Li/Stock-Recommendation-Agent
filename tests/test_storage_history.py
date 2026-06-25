@@ -1,5 +1,5 @@
 """Tests for run-history persistence + query helpers (moto-backed)."""
-from stock_agent.models import Fundamentals, ScoredCandidate
+from stock_agent.models import Fundamentals, ScoredCandidate, SentimentResult
 
 
 def _cand(ticker, rank, final, fund=70.0, sent=60.0, gated=False):
@@ -71,3 +71,71 @@ def test_runs_are_isolated_by_date(store):
     store.save_run("2026-06-25", [_cand("MSFT", 1, 90.0)])
     assert [p["ticker"] for p in store.get_run("2026-06-24")["picks"]] == ["AAPL"]
     assert [p["ticker"] for p in store.get_run("2026-06-25")["picks"]] == ["MSFT"]
+
+
+def _cand_with_snapshot(ticker, rank, final):
+    return ScoredCandidate(
+        ticker=ticker, final_score=final, fundamentals_score=70.0,
+        sentiment_score=60.0,
+        fundamentals=Fundamentals(
+            ticker=ticker, name=f"{ticker} Inc.", revenue_growth=0.15,
+            roe=0.22, current_price=190.5, market_cap=3.0e12, sector="Technology",
+        ),
+        sentiment=SentimentResult(ticker=ticker, mention_count=8,
+                                  avg_sentiment=0.4, news_count=2,
+                                  avg_news_sentiment=0.3),
+        rank=rank,
+    )
+
+
+def test_save_run_persists_point_in_time_snapshot(store):
+    store.save_run("2026-06-25", [_cand_with_snapshot("AAPL", 1, 88.0)])
+    pick = store.get_run("2026-06-25")["picks"][0]
+    # entry_price + descriptive fields recorded for backtesting.
+    assert pick["entry_price"] == 190.5
+    assert pick["sector"] == "Technology"
+    assert pick["market_cap"] == 3.0e12
+    # Raw feature vector captured (subset checks).
+    snap = pick["snapshot"]
+    assert snap["fundamentals"]["revenue_growth"] == 0.15
+    assert snap["fundamentals"]["roe"] == 0.22
+    assert snap["fundamentals"]["current_price"] == 190.5
+    assert snap["sentiment"]["mention_count"] == 8
+    assert snap["sentiment"]["avg_sentiment"] == 0.4
+
+
+def test_save_run_omits_entry_price_when_price_missing(store):
+    # _cand() builds Fundamentals without current_price.
+    store.save_run("2026-06-25", [_cand("NOPX", 1, 70.0)])
+    pick = store.get_run("2026-06-25")["picks"][0]
+    assert "entry_price" not in pick
+
+
+def test_list_run_dates_most_recent_first(store):
+    store.save_run("2026-06-23", [_cand("AAPL", 1, 80.0)])
+    store.save_run("2026-06-25", [_cand("MSFT", 1, 90.0)])
+    store.save_run("2026-06-24", [_cand("NVDA", 1, 85.0)])
+    assert store.list_run_dates() == ["2026-06-25", "2026-06-24", "2026-06-23"]
+
+
+def test_list_run_dates_empty_when_no_runs(store):
+    assert store.list_run_dates() == []
+
+
+def test_save_run_drops_non_finite_snapshot_values(store):
+    # yfinance can emit inf/NaN for some ratios; DynamoDB rejects them, so the
+    # store must drop them rather than crash the whole run.
+    c = ScoredCandidate(
+        ticker="INF", final_score=50.0, fundamentals_score=50.0,
+        sentiment_score=50.0,
+        fundamentals=Fundamentals(ticker="INF", trailing_pe=float("inf"),
+                                  peg_ratio=float("nan"), roe=0.2,
+                                  current_price=10.0),
+        rank=1,
+    )
+    store.save_run("2026-06-25", [c])  # must not raise
+    snap = store.get_run("2026-06-25")["picks"][0]["snapshot"]
+    assert snap["fundamentals"]["roe"] == 0.2
+    # inf/NaN dropped to None on serialize.
+    assert snap["fundamentals"].get("trailing_pe") is None
+    assert snap["fundamentals"].get("peg_ratio") is None

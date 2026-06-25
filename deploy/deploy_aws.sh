@@ -92,6 +92,22 @@ aws lambda add-permission --function-name "$FUNCTION" --region "$REGION" \
 aws events put-targets --rule "$RULE" --region "$REGION" \
   --targets "Id=stock-agent-lambda,Arn=arn:aws:lambda:${REGION}:${ACCOUNT}:function:${FUNCTION}" >/dev/null
 
+# Optional weekly performance-backtest schedule (same function, mode=backtest).
+if [ "${ENABLE_BACKTEST_SCHEDULE:-false}" = "true" ]; then
+  echo "== EventBridge weekly backtest schedule =="
+  BT_RULE="${BACKTEST_RULE_NAME:-stock-agent-backtest-weekly}"
+  BT_SCHEDULE="${BACKTEST_SCHEDULE_EXPRESSION:-cron(0 13 ? * MON *)}"  # Mondays 13:00 UTC
+  aws events put-rule --name "$BT_RULE" --schedule-expression "$BT_SCHEDULE" \
+    --state ENABLED --region "$REGION" \
+    --description "Weekly performance backtest of past recommendations." >/dev/null
+  aws lambda add-permission --function-name "$FUNCTION" --region "$REGION" \
+    --statement-id eventbridge-backtest-invoke --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "arn:aws:events:${REGION}:${ACCOUNT}:rule/${BT_RULE}" >/dev/null 2>&1 || true
+  aws events put-targets --rule "$BT_RULE" --region "$REGION" \
+    --targets "Id=stock-agent-backtest,Arn=arn:aws:lambda:${REGION}:${ACCOUNT}:function:${FUNCTION},Input={\"mode\":\"backtest\"}" >/dev/null
+fi
+
 echo
 echo "Deployed. Confirm the SNS subscription email, then test:"
 echo "  aws lambda invoke --function-name $FUNCTION --region $REGION /tmp/out.json && cat /tmp/out.json"

@@ -6,6 +6,7 @@ Commands:
   watchlist add/remove/list
   history TICKER Show a ticker's score history
   show DATE      Show a stored run's picks
+  backtest       Attribute past picks' forward returns vs SPY (optionally email)
   send-test      Send a tiny test email to verify SES setup
 """
 from __future__ import annotations
@@ -89,6 +90,24 @@ def cmd_show(args, config: Config) -> int:
     return 0
 
 
+def cmd_backtest(args, config: Config) -> int:
+    from .analysis.backtest import BacktestEngine, YFinancePriceProvider
+    from .report.backtest_report import format_backtest_report
+
+    store = _store(config)
+    engine = BacktestEngine(store, YFinancePriceProvider(),
+                            horizons=tuple(args.horizons))
+    result = engine.run()
+    report = format_backtest_report(result)
+    print(report.text_body)
+    if args.email:
+        from .delivery.ses_sender import SesEmailSender
+
+        msg_id = SesEmailSender(config).send_report(report)
+        print(f"\nEmailed backtest report (MessageId={msg_id})")
+    return 0
+
+
 def cmd_send_test(args, config: Config) -> int:
     from .delivery.ses_sender import SesEmailSender
     from .report.builder import Report
@@ -138,6 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     test = sub.add_parser("send-test", help="Send a test email via SES")
     test.set_defaults(func=cmd_send_test)
+
+    bt = sub.add_parser("backtest",
+                        help="Backtest past recommendations vs SPY")
+    bt.add_argument("--horizons", type=int, nargs="+",
+                    default=[30, 90, 180, 365],
+                    help="Forward-return horizons in days")
+    bt.add_argument("--email", action="store_true",
+                    help="Email the backtest report via SES")
+    bt.set_defaults(func=cmd_backtest)
     return p
 
 

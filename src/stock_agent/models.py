@@ -68,6 +68,24 @@ class NewsArticle:
 
 
 @dataclass
+class NewsRef:
+    """A compact news headline reference attached to a pick for the report.
+
+    Lighter than :class:`NewsArticle` (no body) so it's cheap to carry through
+    scoring and render in the email.
+    """
+
+    title: str
+    source: str = ""
+    url: str = ""
+    published: Optional[datetime] = None
+
+    def sort_key(self) -> float:
+        """Recency key for sorting (newest first); undated sorts last."""
+        return self.published.timestamp() if self.published else 0.0
+
+
+@dataclass
 class SentimentResult:
     """Aggregated sentiment for a single ticker."""
 
@@ -123,4 +141,5 @@ class ScoredCandidate:
     rationale: str = ""
     supporting_signals: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
+    news: list["NewsRef"] = field(default_factory=list)  # recent headlines
     rank: int = 0

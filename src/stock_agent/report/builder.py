@@ -54,6 +54,31 @@ def _metric_rows(f: Fundamentals) -> list[tuple[str, str]]:
     ]
 
 
+def _upside(f: Fundamentals) -> Optional[float]:
+    if f.current_price and f.target_mean_price and f.current_price > 0:
+        return f.target_mean_price / f.current_price - 1.0
+    return None
+
+
+def _headline_stats(f: Fundamentals) -> str:
+    """A single compact, high-impact line: sector · price · cap · upside · valn."""
+    bits: list[str] = []
+    if f.sector:
+        bits.append(f.sector)
+    if f.current_price is not None:
+        bits.append(f"${f.current_price:.2f}")
+    if f.market_cap is not None:
+        bits.append(f"{_money(f.market_cap)} cap")
+    up = _upside(f)
+    if up is not None:
+        bits.append(f"{up * 100:+.0f}% to target")
+    if f.peg_ratio is not None and f.peg_ratio > 0:
+        bits.append(f"PEG {f.peg_ratio:.2f}")
+    elif f.trailing_pe is not None and f.trailing_pe > 0:
+        bits.append(f"P/E {f.trailing_pe:.1f}")
+    return "  ·  ".join(bits)
+
+
 class ReportBuilder:
     def __init__(self, top_n: int = 10) -> None:
         self.top_n = top_n
@@ -106,6 +131,10 @@ class ReportBuilder:
                          f"[fundamentals {c.fundamentals_score:.0f} | "
                          f"sentiment {c.sentiment_score:.0f}"
                          + ("  | HYPE-GATED" if c.gated else "") + "]")
+            if c.fundamentals:
+                headline = _headline_stats(c.fundamentals)
+                if headline:
+                    lines.append(f"   {headline}")
             lines.append(f"   {c.rationale}")
             if c.supporting_signals:
                 lines.append("   + " + "; ".join(c.supporting_signals))
@@ -114,6 +143,11 @@ class ReportBuilder:
             if c.fundamentals:
                 metrics = "  ".join(f"{k}: {v}" for k, v in _metric_rows(c.fundamentals))
                 lines.append("   " + metrics)
+            if c.news:
+                lines.append("   Recent news:")
+                for n in c.news:
+                    src = f" ({n.source})" if n.source else ""
+                    lines.append(f"     - {n.title}{src}")
             lines.append("")
 
         if excluded:
@@ -169,6 +203,13 @@ class ReportBuilder:
                 f"{gate_badge}</h2>"
             )
             parts.append(self._score_bar(c))
+            if c.fundamentals:
+                headline = _headline_stats(c.fundamentals)
+                if headline:
+                    parts.append(
+                        "<p style=\"margin:2px 0 8px;color:#374151;font-size:13px;"
+                        f"font-weight:600;\">{esc(headline)}</p>"
+                    )
             parts.append(f"<p style=\"margin:8px 0;\">{esc(c.rationale)}</p>")
 
             if c.supporting_signals:
@@ -181,6 +222,8 @@ class ReportBuilder:
                              f"Risks</strong></p><ul>{items}</ul>")
             if c.fundamentals:
                 parts.append(self._metric_table(c.fundamentals))
+            if c.news:
+                parts.append(self._news_block(c.news))
             parts.append("</div>")
 
         if excluded:
@@ -203,6 +246,21 @@ class ReportBuilder:
             f"<span style=\"color:#666;\">(fundamentals {f_pct:.0f} · "
             f"sentiment {s_pct:.0f})</span></p>"
         )
+
+    @staticmethod
+    def _news_block(news: list) -> str:
+        items = []
+        for n in news:
+            title = html.escape(n.title)
+            src = (f" <span style=\"color:#9ca3af;\">· {html.escape(n.source)}"
+                   "</span>" if n.source else "")
+            if n.url:
+                title = (f"<a href=\"{html.escape(n.url)}\" "
+                         f"style=\"color:#1d4ed8;text-decoration:none;\">{title}</a>")
+            items.append(f"<li style=\"margin:2px 0;\">{title}{src}</li>")
+        return ("<p style=\"margin:8px 0 2px;color:#374151;\"><strong>Recent news"
+                "</strong></p><ul style=\"font-size:13px;margin-top:2px;\">"
+                + "".join(items) + "</ul>")
 
     @staticmethod
     def _metric_table(f: Fundamentals) -> str:

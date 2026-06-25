@@ -71,23 +71,24 @@ EventBridge (daily cron)
 src/stock_agent/
   config.py              # env-driven config + validation
   models.py              # dataclasses shared across stages
-  collectors/            # stocktwits_collector.py, reddit_collector.py, news_collector.py
+  collectors/            # stocktwits_collector.py, reddit_collector.py, news_collector.py, ticker_news.py
   extraction/            # ticker_extractor.py (+ tickers_data.py allow/deny lists)
   sentiment/             # base.py (interface + aggregator), vader.py
   fundamentals/          # yfinance_fetcher.py (caching, missing-data handling)
   scoring/               # engine.py (70/30 + hype gate + explainability)
-  report/                # builder.py (HTML + plain text)
+  analysis/              # backtest.py (forward-return attribution vs SPY)
+  report/                # builder.py (HTML + plain text), backtest_report.py
   delivery/              # ses_sender.py
-  storage/               # dynamo.py (single-table: watchlist + history)
+  storage/               # dynamo.py (single-table: watchlist + history + snapshots)
   orchestrator.py        # wires the pipeline; build_default() for production
-  lambda_handler.py      # EventBridge entry point + error alerting
-  cli.py                 # local CLI + watchlist management
+  lambda_handler.py      # daily entry point + weekly backtest_handler + error alerting
+  cli.py                 # local CLI + watchlist management + backtest
 infra/template.yaml      # SAM template (Lambda + EventBridge + DynamoDB + alarm/SNS)
 deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pandas)
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup (email yourself)
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 84 tests, fully mocked (no network/AWS)
+tests/                   # 105 tests, fully mocked (no network/AWS)
 ```
 
 ## Quick start (local)
@@ -183,3 +184,63 @@ SENDER_EMAIL=you@example.com RECIPIENT_EMAILS=you@example.com \
   if it exceeds the Lambda zip limit). VADER is the guaranteed-free MVP.
 - **Watchlist** — managed via the CLI (`watchlist add/remove/list`) against
   DynamoDB; no code edits needed.
+
+## Performance backtesting & track record
+
+A recommendation engine is only credible if its picks are validated against
+realized returns, so the agent keeps score on itself:
+
+- **Point-in-time snapshots.** Every saved pick records the as-of `entry_price`,
+  sector, market cap, and the full raw fundamentals + sentiment feature vector
+  (`storage/dynamo._feature_snapshot`). This makes each recommendation auditable
+  and lets the backtest measure forward returns from the price that was actually
+  showing at recommendation time — no look-ahead bias.
+- **Attribution engine** (`analysis/backtest.py`). Reads the history and, for
+  horizons of 30/90/180/365 days, computes each pick's forward return, its
+  **excess return vs SPY**, the **hit rate** (share beating the benchmark), and
+  the **rank IC** — the Spearman correlation between the model's score and the
+  realized return. A persistently positive IC is the evidence that the ranking
+  carries genuine signal rather than noise.
+
+Run it locally or on a schedule:
+
+```bash
+stock-agent backtest                 # text report to stdout
+stock-agent backtest --email         # also email the attribution report
+stock-agent backtest --horizons 30 90 180
+```
+
+The weekly Lambda entry point is `stock_agent.lambda_handler.backtest_handler`;
+`deploy/deploy_aws.sh` provisions an optional weekly EventBridge schedule for it
+when `ENABLE_BACKTEST_SCHEDULE=true`.
+
+> The backtest only sees runs saved **after** point-in-time snapshots were added,
+> and a pick must age past the shortest horizon before it can be scored — so the
+> track record builds up over time.
+
+## Roadmap (next credibility upgrades)
+
+Quant-reviewed improvements, in priority order. These are deliberately *not* yet
+implemented; the backtest above is the prerequisite that makes them measurable.
+
+1. **Sector-relative, cross-sectional scoring (#3).** Replace the hand-tuned
+   linear metric thresholds in `scoring/engine.py` (e.g. revenue growth
+   `-10%→+30%`, P/E `40→10`, the binary FCF cliff) with **percentile/z-scores
+   computed within each stock's sector**. This removes the magic numbers and
+   stops comparing, say, a bank's ROE to a software firm's margin. `sector` is
+   already fetched and now persisted, so the data is in place.
+2. **Price-based risk & momentum factors (#4).** Add 6–12m momentum, realized
+   volatility, beta, max drawdown, and a liquidity (ADV) filter from yfinance
+   `.history()` — the same price source the backtest uses. Risk-adjust the final
+   score so a "long-term" recommendation can be defended on a risk basis, not
+   just growth/valuation.
+3. **Decouple the universe from social discovery (#5).** Today the candidate set
+   *is* whatever StockTwits/Reddit/news mention, which biases toward already-hyped
+   megacaps and meme names. Define the universe from a fixed reference set
+   (e.g. S&P 500 / Russell 1000 constituents) and treat social activity as a
+   sentiment *overlay feature* rather than the gatekeeper of what gets analyzed.
+
+Further hardening (lower priority): finance-tuned sentiment (FinBERT) with
+bot/spam filtering and low-sample shrinkage; fundamentals plausibility/outlier
+validation and a second data source; an authoritative exchange ticker master;
+and benchmark-relative framing (sector-percentile ranks) in the email.

@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from .config import Config
 from .extraction.ticker_extractor import TickerExtractor
+from .models import NewsRef
 from .report.builder import Report, ReportBuilder
 from .scoring.engine import ScoringEngine
 from .sentiment.base import SentimentAggregator
@@ -55,6 +56,7 @@ class Orchestrator:
         scoring_engine: Optional[ScoringEngine] = None,
         report_builder: Optional[ReportBuilder] = None,
         email_sender: Any = None,
+        news_provider: Any = None,
     ) -> None:
         self.config = config
         self.reddit = reddit_collector
@@ -67,6 +69,7 @@ class Orchestrator:
         self.engine = scoring_engine or ScoringEngine(config)
         self.report_builder = report_builder or ReportBuilder(top_n=config.top_n)
         self.email = email_sender
+        self.news_provider = news_provider
 
     @classmethod
     def build_default(cls, config: Config, store: Any = None) -> "Orchestrator":
@@ -74,6 +77,7 @@ class Orchestrator:
         from .collectors.news_collector import NewsCollector
         from .collectors.reddit_collector import RedditCollector
         from .collectors.stocktwits_collector import StockTwitsCollector
+        from .collectors.ticker_news import YFinanceNewsProvider
         from .delivery.ses_sender import SesEmailSender
         from .fundamentals.yfinance_fetcher import FundamentalsFetcher
         from .sentiment.vader import VaderAnalyzer
@@ -96,6 +100,7 @@ class Orchestrator:
             scoring_engine=ScoringEngine(config),
             report_builder=ReportBuilder(top_n=config.top_n),
             email_sender=SesEmailSender(config, store_region_client(config)),
+            news_provider=YFinanceNewsProvider(),
         )
 
     def run(self, run_date: Optional[str] = None, send_email: bool = True,
@@ -139,6 +144,9 @@ class Orchestrator:
         ranked, excluded = self.engine.rank(fundamentals, sentiment)
         logger.info("Ranked %d, excluded %d", len(ranked), len(excluded))
 
+        # 6b. Attach recent, stock-specific news to the picks that will be shown.
+        self._attach_news(ranked[: self.config.top_n], articles)
+
         # 7. Report
         stats = {
             "candidates": len(candidates),
@@ -178,6 +186,43 @@ class Orchestrator:
             message_id=message_id,
             emailed=emailed,
         )
+
+    def _attach_news(self, picks: list, articles: list) -> None:
+        """Attach up to 3 recent, stock-specific headlines to each pick.
+
+        Two sources, merged and de-duplicated by title:
+          1. RSS articles already collected this run that name the ticker
+             (free, deterministic).
+          2. Best-effort per-ticker headlines from ``news_provider`` (yfinance),
+             which is where most stock-specific coverage comes from. Any failure
+             there is swallowed so it never breaks the run.
+        """
+        rss_by_ticker: dict[str, list[NewsRef]] = {}
+        for a in articles:
+            for t in self.extractor.extract_from_text(a.text):
+                rss_by_ticker.setdefault(t, []).append(
+                    NewsRef(title=a.title, source=a.source, url=a.link,
+                            published=a.published)
+                )
+
+        for c in picks:
+            refs: list[NewsRef] = list(rss_by_ticker.get(c.ticker, []))
+            if self.news_provider is not None:
+                try:
+                    refs.extend(self.news_provider.recent(c.ticker, limit=3))
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("News provider failed for %s: %s",
+                                   c.ticker, exc)
+            # De-dupe by normalized title, keep most recent first.
+            seen: set[str] = set()
+            unique: list[NewsRef] = []
+            for r in sorted(refs, key=lambda x: x.sort_key(), reverse=True):
+                key = r.title.strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                unique.append(r)
+            c.news = unique[:3]
 
 
 def store_region_client(config: Config) -> Any:

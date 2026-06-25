@@ -192,3 +192,52 @@ def test_stocktwits_and_reddit_aggregate_as_social():
     assert orch.stocktwits.watchlist_arg is not None
     # Report reflects combined social posts (reddit + stocktwits).
     assert "stocktwits" in result.report.text_body.lower()
+
+
+class FakeNewsProvider:
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def recent(self, ticker, limit=3):
+        return list(self._mapping.get(ticker, []))[:limit]
+
+
+def test_rss_news_attached_to_picks():
+    # The default fixture's article "AAPL posts strong quarter" names AAPL,
+    # so RSS-derived news should attach to the AAPL pick automatically.
+    orch = _build()
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    assert "Recent news" in result.report.text_body
+    assert "AAPL posts strong quarter" in result.report.text_body
+
+
+def test_news_provider_headlines_attached_and_deduped():
+    from stock_agent.models import NewsRef
+
+    orch = _build()
+    orch.news_provider = FakeNewsProvider({
+        "AAPL": [
+            # Duplicate of the RSS headline (same title) must be de-duped.
+            NewsRef(title="AAPL posts strong quarter", source="Yahoo"),
+            NewsRef(title="Apple ships record iPhones", source="CNBC",
+                    url="https://example.com/iphone"),
+        ]
+    })
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    text = result.report.text_body
+    assert "Apple ships record iPhones" in text
+    # De-dup: the shared headline appears once.
+    assert text.count("AAPL posts strong quarter") == 1
+
+
+def test_news_provider_failure_does_not_break_run():
+    class Boom:
+        def recent(self, ticker, limit=3):
+            raise RuntimeError("news API down")
+
+    orch = _build()
+    orch.news_provider = Boom()
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    # Run still completes and produces a report.
+    assert result.ranked_count >= 1
+    assert "AAPL" in result.report.text_body

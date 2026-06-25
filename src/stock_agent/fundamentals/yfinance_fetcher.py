@@ -19,6 +19,7 @@ network access. The factory takes a symbol and returns an object exposing an
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Callable, Optional
 
@@ -34,14 +35,14 @@ def _default_ticker_factory(symbol: str) -> Any:
 
 
 def _f(value: Any) -> Optional[float]:
-    """Coerce to float, treating None/NaN/non-numeric as missing."""
+    """Coerce to float, treating None/NaN/Inf/non-numeric as missing."""
     if value is None:
         return None
     try:
         f = float(value)
     except (TypeError, ValueError):
         return None
-    if f != f:  # NaN
+    if not math.isfinite(f):  # NaN or +/-Inf
         return None
     return f
 
