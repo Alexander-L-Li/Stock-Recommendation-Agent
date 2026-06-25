@@ -86,6 +86,29 @@ class NewsRef:
 
 
 @dataclass
+class PriceFactors:
+    """Price-derived risk & momentum factors for a ticker (roadmap item #4).
+
+    Computed from daily price history (yfinance ``.history()``). Any field may be
+    ``None`` when there isn't enough history. These let a "long-term" pick be
+    defended on a risk basis, not just growth/valuation.
+    """
+
+    ticker: str
+    momentum: Optional[float] = None        # 12-1 month total return (fraction)
+    volatility: Optional[float] = None      # annualized daily-return stdev
+    beta: Optional[float] = None            # vs benchmark (SPY)
+    max_drawdown: Optional[float] = None    # worst peak-to-trough, 1y (<= 0)
+    avg_dollar_volume: Optional[float] = None  # mean daily $ volume (liquidity)
+    error: Optional[str] = None
+
+    def available_count(self) -> int:
+        keys = [self.momentum, self.volatility, self.beta,
+                self.max_drawdown, self.avg_dollar_volume]
+        return sum(1 for k in keys if k is not None)
+
+
+@dataclass
 class SentimentResult:
     """Aggregated sentiment for a single ticker."""
 
@@ -138,6 +161,7 @@ class ScoredCandidate:
     gated: bool = False  # True if hype gate suppressed sentiment contribution
     fundamentals: Optional[Fundamentals] = None
     sentiment: Optional[SentimentResult] = None
+    factors: Optional["PriceFactors"] = None  # price-based risk/momentum (#4)
     rationale: str = ""
     supporting_signals: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)

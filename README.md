@@ -1,10 +1,12 @@
 # Daily Long-Term Stock Recommendation Agent
 
-An autonomous, **free** agent that runs once daily, discovers candidate stocks
-from **StockTwits**, **Reddit**, and business news, scores them primarily on
-**financial fundamentals** (70%) with **social/news sentiment** as a secondary
-tilt (30%), and emails a ranked, explainable report. Long-term horizon, no
-trading, personal use.
+An autonomous, **free** agent that runs once daily, screens a fixed universe
+(the **S&P 500**), scores candidates primarily on **financial fundamentals**
+(70%, ranked **sector-relative**) with **social/news sentiment** as a secondary
+tilt (30%) and a **price-based risk/momentum** adjustment, and emails a ranked,
+explainable report. Social chatter from **StockTwits**, **Reddit**, and business
+news is a prioritization + sentiment *overlay*, not the gatekeeper of what gets
+analyzed. Long-term horizon, no trading, personal use.
 
 > Signals and reasoning to aid your own research — **not financial advice**.
 
@@ -74,12 +76,14 @@ src/stock_agent/
   collectors/            # stocktwits_collector.py, reddit_collector.py, news_collector.py, ticker_news.py
   extraction/            # ticker_extractor.py (+ tickers_data.py allow/deny lists)
   sentiment/             # base.py (interface + aggregator), vader.py
-  fundamentals/          # yfinance_fetcher.py (caching, missing-data handling)
-  scoring/               # engine.py (70/30 + hype gate + explainability)
+  fundamentals/          # yfinance_fetcher.py + price_factors.py (risk/momentum)
+  scoring/               # engine.py (70/30 + hype gate + sector-relative + risk tilt)
   analysis/              # backtest.py (forward-return attribution vs SPY)
   report/                # builder.py (HTML + plain text), backtest_report.py
   delivery/              # ses_sender.py
   storage/               # dynamo.py (single-table: watchlist + history + snapshots)
+  universe.py            # FixedUniverse selector (#5)
+  universe_data.py       # vendored S&P 500 constituents
   orchestrator.py        # wires the pipeline; build_default() for production
   lambda_handler.py      # daily entry point + weekly backtest_handler + error alerting
   cli.py                 # local CLI + watchlist management + backtest
@@ -88,7 +92,7 @@ deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pan
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup (email yourself)
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 105 tests, fully mocked (no network/AWS)
+tests/                   # 135 tests, fully mocked (no network/AWS)
 ```
 
 ## Quick start (local)
@@ -151,6 +155,13 @@ runs locally and in Lambda. Key variables:
 | `HYPE_GATE_MIN_FUNDAMENTALS` | 40 | Min fundamentals score to allow sentiment lift |
 | `MIN_FUNDAMENTAL_METRICS` | 3 | Data-quality gate |
 | `MAX_CANDIDATES` | 40 | Universe cap per run |
+| `ENABLE_FIXED_UNIVERSE` | true | Analyze the S&P 500 index (#5); social is an overlay |
+| `ENABLE_SECTOR_RELATIVE` | true | Score growth/quality by sector percentile (#3) |
+| `SECTOR_MIN_PEERS` | 4 | Min sector cohort size before sector-relative kicks in |
+| `ENABLE_PRICE_FACTORS` | true | Apply price-based risk/momentum tilt (#4) |
+| `RISK_TILT_MAX` | 10 | Max +/- points the risk tilt can move a score |
+| `MIN_DOLLAR_VOLUME` | 2,000,000 | Liquidity floor ($/day); thinner names can't be boosted |
+| `PRICE_BENCHMARK` | SPY | Benchmark for beta and backtest excess return |
 | `TOP_N` | 10 | Picks in the report |
 
 ## Cost
@@ -218,29 +229,38 @@ when `ENABLE_BACKTEST_SCHEDULE=true`.
 > and a pick must age past the shortest horizon before it can be scored — so the
 > track record builds up over time.
 
-## Roadmap (next credibility upgrades)
+## Sector-relative scoring, risk factors & a fixed universe (#3–#5)
 
-Quant-reviewed improvements, in priority order. These are deliberately *not* yet
-implemented; the backtest above is the prerequisite that makes them measurable.
+Quant-reviewed credibility upgrades — **now implemented** (the backtest above is
+what makes their impact measurable over time):
 
-1. **Sector-relative, cross-sectional scoring (#3).** Replace the hand-tuned
-   linear metric thresholds in `scoring/engine.py` (e.g. revenue growth
-   `-10%→+30%`, P/E `40→10`, the binary FCF cliff) with **percentile/z-scores
-   computed within each stock's sector**. This removes the magic numbers and
-   stops comparing, say, a bank's ROE to a software firm's margin. `sector` is
-   already fetched and now persisted, so the data is in place.
-2. **Price-based risk & momentum factors (#4).** Add 6–12m momentum, realized
-   volatility, beta, max drawdown, and a liquidity (ADV) filter from yfinance
-   `.history()` — the same price source the backtest uses. Risk-adjust the final
-   score so a "long-term" recommendation can be defended on a risk basis, not
-   just growth/valuation.
-3. **Decouple the universe from social discovery (#5).** Today the candidate set
-   *is* whatever StockTwits/Reddit/news mention, which biases toward already-hyped
-   megacaps and meme names. Define the universe from a fixed reference set
-   (e.g. S&P 500 / Russell 1000 constituents) and treat social activity as a
-   sentiment *overlay feature* rather than the gatekeeper of what gets analyzed.
+1. **Sector-relative, cross-sectional scoring (#3)** — `scoring/engine.py`.
+   Growth/quality metrics (revenue & earnings growth, profit margin, ROE,
+   debt/equity) are scored by **percentile rank within the candidate's GICS
+   sector** across the whole cohort, instead of fixed linear thresholds, so we
+   stop comparing a bank's ROE to a software firm's margin. Valuation (PEG/P/E)
+   and the free-cash-flow quality check keep their absolute treatment, and a
+   sector with fewer than `SECTOR_MIN_PEERS` (default 4) names gracefully falls
+   back to absolute scaling. Toggle with `ENABLE_SECTOR_RELATIVE`.
+2. **Price-based risk & momentum factors (#4)** — `fundamentals/price_factors.py`.
+   12‑1 month momentum, annualized volatility, beta vs SPY, max drawdown, and a
+   dollar-volume liquidity proxy are computed from yfinance `.history()`. They
+   apply a **bounded risk tilt** (±`RISK_TILT_MAX`, default 10 pts) on top of the
+   70/30 blend — momentum lifts, high volatility/deep drawdowns drag — and a thin
+   liquidity name can never be *boosted*. Factors are shown in the email and
+   persisted in the snapshot for attribution. Toggle with `ENABLE_PRICE_FACTORS`.
+3. **Decoupled universe (#5)** — `universe.py` + `universe_data.py`. The analysis
+   universe is now the **fixed S&P 500** (vendored), not whatever social media
+   happens to mention. Social activity is a *prioritization overlay* (which index
+   names get screened first under the per-run cap); the rest of the index rotates
+   by date for full coverage over ~2 weeks. The watchlist is always included and
+   is the escape hatch for off-index names. Toggle with `ENABLE_FIXED_UNIVERSE`.
 
-Further hardening (lower priority): finance-tuned sentiment (FinBERT) with
+> Refresh the vendored S&P 500 list by re-downloading the constituents CSV and
+> regenerating `src/stock_agent/universe_data.py` (symbols in yfinance form, e.g.
+> `BRK-B`).
+
+Further hardening (still on the roadmap): finance-tuned sentiment (FinBERT) with
 bot/spam filtering and low-sample shrinkage; fundamentals plausibility/outlier
 validation and a second data source; an authoritative exchange ticker master;
 and benchmark-relative framing (sector-percentile ranks) in the email.

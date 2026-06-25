@@ -28,10 +28,11 @@ Model (fundamentals-dominant 70/30):
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from typing import Optional
 
 from ..config import Config
-from ..models import Fundamentals, ScoredCandidate, SentimentResult
+from ..models import Fundamentals, PriceFactors, ScoredCandidate, SentimentResult
 
 # Sub-metric weights within the fundamentals composite (sum to 1.0).
 _FUNDAMENTAL_WEIGHTS = {
@@ -43,6 +44,21 @@ _FUNDAMENTAL_WEIGHTS = {
     "free_cash_flow": 0.10,
     "valuation": 0.12,
 }
+
+# Metrics scored cross-sectionally (percentile within sector) when #3 is on.
+# direction +1 => higher is better; -1 => lower is better (inverted percentile).
+# Valuation (PEG/P/E mixing) and free cash flow (a binary quality gate) keep
+# their absolute treatment.
+_RELATIVE_METRICS: tuple[tuple[str, str, int], ...] = (
+    ("revenue_growth", "revenue_growth", +1),
+    ("earnings_growth", "earnings_growth", +1),
+    ("profit_margin", "profit_margin", +1),
+    ("roe", "roe", +1),
+    ("debt_to_equity", "debt_to_equity", -1),
+)
+
+# Risk-tilt sub-weights (renormalized over whichever factors are present).
+_RISK_WEIGHTS = {"momentum": 0.50, "volatility": 0.25, "drawdown": 0.25}
 
 # Mention volume that maps to a full volume boost (diminishing returns via log).
 _VOLUME_SATURATION = 25
@@ -60,29 +76,65 @@ def _scale(value: float, lo: float, hi: float) -> float:
     return _clamp((value - lo) / (hi - lo) * 100.0)
 
 
+def _percentile_scores(
+    pairs: list[tuple[str, float]], direction: int
+) -> dict[str, float]:
+    """Percentile rank (0-100) of each value within ``pairs``.
+
+    Uses the midrank convention so ties share the average rank. ``direction``
+    -1 inverts (for lower-is-better metrics like debt/equity)."""
+    vals = [v for _, v in pairs]
+    n = len(vals)
+    out: dict[str, float] = {}
+    for t, v in pairs:
+        less = sum(1 for x in vals if x < v)
+        equal = sum(1 for x in vals if x == v)
+        pct = (less + 0.5 * equal) / n * 100.0
+        out[t] = pct if direction > 0 else 100.0 - pct
+    return out
+
+
 class ScoringEngine:
     def __init__(self, config: Optional[Config] = None) -> None:
         self.config = config or Config()
 
     # ---------------- fundamentals ----------------
-    def score_fundamentals(self, f: Fundamentals) -> tuple[float, dict[str, float]]:
-        """Return (composite 0-100, per-metric sub-scores)."""
+    def score_fundamentals(
+        self, f: Fundamentals,
+        relative_subs: Optional[dict[str, float]] = None,
+    ) -> tuple[float, dict[str, float]]:
+        """Return (composite 0-100, per-metric sub-scores).
+
+        When ``relative_subs`` is provided (sector-relative percentile scores
+        from :meth:`_cross_sectional_subscores`, #3), those override the absolute
+        linear maps for the metrics they cover; any metric not present in the
+        override falls back to absolute scaling. Called with no override (e.g.
+        directly in tests) the behavior is the original absolute model.
+        """
+        rel = relative_subs or {}
         subs: dict[str, float] = {}
+
+        def pick(key: str, absolute: float) -> float:
+            return rel[key] if key in rel else absolute
 
         if f.revenue_growth is not None:
             # -10% -> 0, +30% -> 100
-            subs["revenue_growth"] = _scale(f.revenue_growth, -0.10, 0.30)
+            subs["revenue_growth"] = pick(
+                "revenue_growth", _scale(f.revenue_growth, -0.10, 0.30))
         if f.earnings_growth is not None:
-            subs["earnings_growth"] = _scale(f.earnings_growth, -0.10, 0.30)
+            subs["earnings_growth"] = pick(
+                "earnings_growth", _scale(f.earnings_growth, -0.10, 0.30))
         if f.profit_margin is not None:
             # 0% -> 0, 25% -> 100
-            subs["profit_margin"] = _scale(f.profit_margin, 0.0, 0.25)
+            subs["profit_margin"] = pick(
+                "profit_margin", _scale(f.profit_margin, 0.0, 0.25))
         if f.roe is not None:
             # 0% -> 0, 30% -> 100
-            subs["roe"] = _scale(f.roe, 0.0, 0.30)
+            subs["roe"] = pick("roe", _scale(f.roe, 0.0, 0.30))
         if f.debt_to_equity is not None:
             # inverted: 0x -> 100, 2.5x -> 0
-            subs["debt_to_equity"] = _scale(f.debt_to_equity, 2.5, 0.0)
+            subs["debt_to_equity"] = pick(
+                "debt_to_equity", _scale(f.debt_to_equity, 2.5, 0.0))
         if f.free_cash_flow is not None:
             # positive FCF rewarded; negative penalized
             subs["free_cash_flow"] = 85.0 if f.free_cash_flow > 0 else 10.0
@@ -133,9 +185,13 @@ class ScoringEngine:
         return _clamp(0.75 * polarity + 0.25 * volume)
 
     # ---------------- composite + ranking ----------------
-    def score_candidate(self, ticker: str, fundamentals: Fundamentals,
-                        sentiment: Optional[SentimentResult]) -> ScoredCandidate:
-        f_score, subs = self.score_fundamentals(fundamentals)
+    def score_candidate(
+        self, ticker: str, fundamentals: Fundamentals,
+        sentiment: Optional[SentimentResult],
+        relative_subs: Optional[dict[str, float]] = None,
+        factors: Optional[PriceFactors] = None,
+    ) -> ScoredCandidate:
+        f_score, subs = self.score_fundamentals(fundamentals, relative_subs)
         s_score = self.score_sentiment(sentiment)
 
         base = (self.config.fundamentals_weight * f_score
@@ -148,6 +204,16 @@ class ScoringEngine:
         else:
             final = base
 
+        # #4: bounded price-based risk/momentum tilt on top of the 70/30 blend.
+        use_factors = (
+            factors is not None
+            and factors.error is None
+            and self.config.enable_price_factors
+        )
+        if use_factors:
+            tilt, _risk_score = self._risk_tilt(factors)
+            final = final + tilt
+
         cand = ScoredCandidate(
             ticker=ticker,
             final_score=round(_clamp(final), 2),
@@ -156,26 +222,70 @@ class ScoringEngine:
             gated=gated,
             fundamentals=fundamentals,
             sentiment=sentiment,
+            factors=factors,
         )
         self._explain(cand, subs)
         return cand
+
+    def _risk_tilt(self, factors: PriceFactors) -> tuple[float, Optional[float]]:
+        """Map price factors to a bounded final-score adjustment.
+
+        Returns ``(tilt, risk_score)`` where ``tilt`` is in
+        ``[-risk_tilt_max, +risk_tilt_max]``. Momentum (higher better),
+        volatility and drawdown (lower/shallower better) drive a 0-100 risk
+        score; thin liquidity caps the tilt at <= 0 so an illiquid name can
+        never be *boosted*."""
+        comps: dict[str, float] = {}
+        if factors.momentum is not None:
+            comps["momentum"] = _scale(factors.momentum, -0.30, 0.50)
+        if factors.volatility is not None:
+            comps["volatility"] = _scale(factors.volatility, 0.80, 0.15)
+        if factors.max_drawdown is not None:
+            comps["drawdown"] = _scale(factors.max_drawdown, -0.60, -0.05)
+        if not comps:
+            return 0.0, None
+
+        total_w = sum(_RISK_WEIGHTS[k] for k in comps)
+        risk_score = sum(comps[k] * _RISK_WEIGHTS[k] for k in comps) / total_w
+        tilt = (risk_score - 50.0) / 50.0 * self.config.risk_tilt_max
+
+        adv = factors.avg_dollar_volume
+        if adv is not None and adv < self.config.min_dollar_volume:
+            tilt = min(tilt, 0.0)  # illiquid: no positive boost
+        return tilt, risk_score
 
     def rank(
         self,
         fundamentals: dict[str, Fundamentals],
         sentiment: dict[str, SentimentResult],
+        factors: Optional[dict[str, PriceFactors]] = None,
     ) -> tuple[list[ScoredCandidate], list[ScoredCandidate]]:
         """Score all candidates.
 
         Returns ``(ranked, excluded)`` where ``excluded`` holds candidates that
         failed the data-quality gate (fetch error or too few metrics).
+
+        When sector-relative scoring (#3) is enabled, growth/quality sub-scores
+        are computed as percentile ranks *across the whole cohort, within each
+        GICS sector*, so this is where cross-sectional context enters. Price
+        factors (#4), when supplied, apply a bounded risk tilt per candidate.
         """
+        factors = factors or {}
+        overrides = (
+            self._cross_sectional_subscores(fundamentals)
+            if self.config.enable_sector_relative else {}
+        )
+
         ranked: list[ScoredCandidate] = []
         excluded: list[ScoredCandidate] = []
 
         for ticker, f in fundamentals.items():
             s = sentiment.get(ticker)
-            cand = self.score_candidate(ticker, f, s)
+            cand = self.score_candidate(
+                ticker, f, s,
+                relative_subs=overrides.get(ticker),
+                factors=factors.get(ticker),
+            )
             insufficient = (
                 f.error is not None
                 or f.available_count() < self.config.min_fundamental_metrics
@@ -196,6 +306,36 @@ class ScoringEngine:
         for i, cand in enumerate(ranked, start=1):
             cand.rank = i
         return ranked, excluded
+
+    def _cross_sectional_subscores(
+        self, fundamentals: dict[str, Fundamentals]
+    ) -> dict[str, dict[str, float]]:
+        """Percentile-rank growth/quality metrics within each sector (#3).
+
+        Only emits an override for a (ticker, metric) when that ticker's sector
+        cohort has at least ``sector_min_peers`` members with the metric present;
+        otherwise the metric is left to fall back to absolute scaling, so thin
+        sectors and tiny universes degrade gracefully to the original model.
+        """
+        by_sector: dict[str, list[tuple[str, Fundamentals]]] = defaultdict(list)
+        for t, f in fundamentals.items():
+            if f.error is not None:
+                continue
+            by_sector[(f.sector or "—")].append((t, f))
+
+        overrides: dict[str, dict[str, float]] = defaultdict(dict)
+        for _sector, members in by_sector.items():
+            for metric, attr, direction in _RELATIVE_METRICS:
+                pairs = [
+                    (t, getattr(f, attr))
+                    for t, f in members
+                    if getattr(f, attr) is not None
+                ]
+                if len(pairs) < self.config.sector_min_peers:
+                    continue  # too few peers -> absolute fallback
+                for t, score in _percentile_scores(pairs, direction).items():
+                    overrides[t][metric] = score
+        return overrides
 
     # ---------------- explainability ----------------
     def _explain(self, cand: ScoredCandidate, subs: dict[str, float]) -> None:
@@ -259,7 +399,29 @@ class ScoringEngine:
             elif upside <= -0.05:
                 risks.append(f"Trading above analyst target ({pct(upside)})")
 
+        # Price-based risk / momentum factors (#4)
+        self._explain_factors(cand, signals, risks)
+
         cand.rationale = self._compose_rationale(cand)
+
+    def _explain_factors(self, cand: ScoredCandidate,
+                         signals: list[str], risks: list[str]) -> None:
+        pf = cand.factors
+        if pf is None or pf.error is not None:
+            return
+        if pf.momentum is not None:
+            if pf.momentum >= 0.15:
+                signals.append(f"Positive 12-mo momentum (+{pf.momentum * 100:.0f}%)")
+            elif pf.momentum <= -0.15:
+                risks.append(f"Negative 12-mo momentum ({pf.momentum * 100:.0f}%)")
+        if pf.volatility is not None and pf.volatility >= 0.50:
+            risks.append(f"Elevated volatility ({pf.volatility * 100:.0f}% annualized)")
+        if pf.max_drawdown is not None and pf.max_drawdown <= -0.35:
+            risks.append(f"Deep 1y drawdown ({pf.max_drawdown * 100:.0f}%)")
+        if (pf.avg_dollar_volume is not None
+                and pf.avg_dollar_volume < self.config.min_dollar_volume):
+            risks.append(
+                f"Thin liquidity (~${pf.avg_dollar_volume / 1e6:.1f}M/day)")
 
     @staticmethod
     def _compose_rationale(cand: ScoredCandidate) -> str:

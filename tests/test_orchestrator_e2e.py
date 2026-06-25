@@ -241,3 +241,86 @@ def test_news_provider_failure_does_not_break_run():
     # Run still completes and produces a report.
     assert result.ranked_count >= 1
     assert "AAPL" in result.report.text_body
+
+
+# --- #5: fixed universe decoupled from social discovery ---
+def test_fixed_universe_includes_unmentioned_index_names():
+    from stock_agent.universe import FixedUniverse
+
+    config = Config(max_candidates=6)
+    orch = _build(config)
+    orch.universe = FixedUniverse(["AAPL", "MEME", "NVDA", "MSFT", "KO", "JNJ"])
+    # NVDA is never mentioned in any post, yet it's in the index.
+    orch.fundamentals._mapping["NVDA"] = Fundamentals(
+        ticker="NVDA", revenue_growth=0.50, earnings_growth=0.50,
+        profit_margin=0.30, roe=0.40, debt_to_equity=0.3,
+        free_cash_flow=1e10, trailing_pe=30.0, sector="Tech", name="Nvidia")
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    # Screened purely because it's an index member, not because of social buzz.
+    assert "NVDA" in result.candidates
+    assert "AAPL" in result.candidates
+
+
+def test_fixed_universe_ignores_offindex_hype_but_keeps_watchlist():
+    from stock_agent.universe import FixedUniverse
+
+    config = Config(max_candidates=6)
+    orch = _build(config)
+    orch.store = FakeStore(watchlist=["TSLA"])  # off-index escape hatch
+    orch.universe = FixedUniverse(["AAPL", "NVDA", "MSFT", "KO", "JNJ", "XOM"])
+    orch.fundamentals._mapping["TSLA"] = Fundamentals(
+        ticker="TSLA", revenue_growth=0.10, earnings_growth=0.05,
+        profit_margin=0.10, roe=0.12, debt_to_equity=0.5, trailing_pe=60.0,
+        free_cash_flow=1e9, name="Tesla")
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    # MEME is mentioned socially but is NOT in the index -> dropped.
+    assert "MEME" not in result.candidates
+    # Watchlist name is included even though off-index.
+    assert "TSLA" in result.candidates
+
+
+# --- #4: price factors threaded through scoring + persistence ---
+class FakeFactorFetcher:
+    def __init__(self, factors):
+        self._factors = factors
+
+    def fetch_many(self, tickers):
+        from stock_agent.models import PriceFactors
+        return {t: self._factors.get(t, PriceFactors(ticker=t, error="none"))
+                for t in tickers}
+
+
+def test_factors_tilt_score_surface_in_report_and_persist():
+    from stock_agent.models import PriceFactors
+
+    orch = _build()
+    orch.factor_fetcher = FakeFactorFetcher({
+        "AAPL": PriceFactors(ticker="AAPL", momentum=0.40, volatility=0.22,
+                             beta=1.1, max_drawdown=-0.12,
+                             avg_dollar_volume=8e8),
+    })
+    store = FakeStore()
+    orch.store = store
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=True)
+
+    # Risk/momentum line surfaced in the report.
+    assert "Risk" in result.report.text_body
+    assert "12-mo" in result.report.text_body or "vol" in result.report.text_body
+
+    saved_cands = store.saved[0][1]
+    top = saved_cands[0]
+    assert top.ticker == "AAPL"
+    assert top.factors is not None and top.factors.momentum == 0.40
+    assert any("momentum" in s.lower() for s in top.supporting_signals)
+
+
+def test_factor_fetch_failure_does_not_break_run():
+    class Boom:
+        def fetch_many(self, tickers):
+            raise RuntimeError("yfinance down")
+
+    orch = _build()
+    orch.factor_fetcher = Boom()
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    assert result.ranked_count >= 1
+    assert "AAPL" in result.report.text_body

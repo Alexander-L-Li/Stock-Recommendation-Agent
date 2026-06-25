@@ -86,10 +86,29 @@ class Config:
     # --- Discovery / universe ---
     max_candidates: int = 40       # cap on tickers scored per run (cost/time guard)
     min_mentions: int = 1          # minimum mentions to be a discovery candidate
+    # #5: analyze a fixed reference index (S&P 500) instead of only what social
+    # media mentions; social becomes a prioritization overlay, not the gate.
+    # The per-run cap still bounds cost; coverage rotates by date.
+    enable_fixed_universe: bool = True
 
     # --- Scoring weights (must sum to 1.0) ---
     fundamentals_weight: float = 0.70
     sentiment_weight: float = 0.30
+
+    # --- #3: sector-relative cross-sectional scoring ---
+    # Score growth/quality metrics by percentile rank within a candidate's GICS
+    # sector instead of fixed linear thresholds. Falls back to absolute scaling
+    # when a sector cohort has fewer than ``sector_min_peers`` members.
+    enable_sector_relative: bool = True
+    sector_min_peers: int = 4
+
+    # --- #4: price-based risk/momentum factors ---
+    # Apply a bounded risk tilt (+/- ``risk_tilt_max`` points) to the final score
+    # from momentum/volatility/drawdown, and flag thin liquidity.
+    enable_price_factors: bool = True
+    risk_tilt_max: float = 10.0
+    min_dollar_volume: float = 2_000_000.0  # liquidity floor ($/day)
+    price_benchmark: str = "SPY"
 
     # --- Hype gate ---
     # A stock must clear this normalized fundamentals score (0-100) before
@@ -132,10 +151,25 @@ class Config:
             news_feeds=_env_list("NEWS_FEEDS", cls().news_feeds),
             max_candidates=_env_int("MAX_CANDIDATES", cls.max_candidates),
             min_mentions=_env_int("MIN_MENTIONS", cls.min_mentions),
+            enable_fixed_universe=_env_bool(
+                "ENABLE_FIXED_UNIVERSE", cls.enable_fixed_universe
+            ),
             fundamentals_weight=_env_float(
                 "FUNDAMENTALS_WEIGHT", cls.fundamentals_weight
             ),
             sentiment_weight=_env_float("SENTIMENT_WEIGHT", cls.sentiment_weight),
+            enable_sector_relative=_env_bool(
+                "ENABLE_SECTOR_RELATIVE", cls.enable_sector_relative
+            ),
+            sector_min_peers=_env_int("SECTOR_MIN_PEERS", cls.sector_min_peers),
+            enable_price_factors=_env_bool(
+                "ENABLE_PRICE_FACTORS", cls.enable_price_factors
+            ),
+            risk_tilt_max=_env_float("RISK_TILT_MAX", cls.risk_tilt_max),
+            min_dollar_volume=_env_float(
+                "MIN_DOLLAR_VOLUME", cls.min_dollar_volume
+            ),
+            price_benchmark=os.environ.get("PRICE_BENCHMARK", cls.price_benchmark),
             hype_gate_min_fundamentals=_env_float(
                 "HYPE_GATE_MIN_FUNDAMENTALS", cls.hype_gate_min_fundamentals
             ),

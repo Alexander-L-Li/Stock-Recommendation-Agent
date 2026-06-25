@@ -96,6 +96,18 @@ def _feature_snapshot(c: ScoredCandidate) -> dict:
             "news_count": s.news_count,
             "avg_news_sentiment": s.avg_news_sentiment,
         }
+    pf = getattr(c, "factors", None)
+    if pf is not None and getattr(pf, "error", None) is None:
+        factors = {
+            "momentum": pf.momentum,
+            "volatility": pf.volatility,
+            "beta": pf.beta,
+            "max_drawdown": pf.max_drawdown,
+            "avg_dollar_volume": pf.avg_dollar_volume,
+        }
+        present = {k: v for k, v in factors.items() if v is not None}
+        if present:
+            snap["factors"] = present
     return snap
 
 

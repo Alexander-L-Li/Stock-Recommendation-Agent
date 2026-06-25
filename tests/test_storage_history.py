@@ -111,6 +111,30 @@ def test_save_run_omits_entry_price_when_price_missing(store):
     assert "entry_price" not in pick
 
 
+def test_save_run_persists_price_factors(store):
+    from stock_agent.models import PriceFactors
+
+    c = _cand_with_snapshot("AAPL", 1, 88.0)
+    c.factors = PriceFactors(ticker="AAPL", momentum=0.18, volatility=0.27,
+                             beta=1.05, max_drawdown=-0.15,
+                             avg_dollar_volume=7.5e8)
+    store.save_run("2026-06-25", [c])
+    snap = store.get_run("2026-06-25")["picks"][0]["snapshot"]
+    assert snap["factors"]["momentum"] == 0.18
+    assert snap["factors"]["beta"] == 1.05
+    assert snap["factors"]["avg_dollar_volume"] == 7.5e8
+
+
+def test_save_run_omits_factors_when_errored(store):
+    from stock_agent.models import PriceFactors
+
+    c = _cand_with_snapshot("AAPL", 1, 88.0)
+    c.factors = PriceFactors(ticker="AAPL", error="insufficient history")
+    store.save_run("2026-06-25", [c])
+    snap = store.get_run("2026-06-25")["picks"][0]["snapshot"]
+    assert "factors" not in snap
+
+
 def test_list_run_dates_most_recent_first(store):
     store.save_run("2026-06-23", [_cand("AAPL", 1, 80.0)])
     store.save_run("2026-06-25", [_cand("MSFT", 1, 90.0)])

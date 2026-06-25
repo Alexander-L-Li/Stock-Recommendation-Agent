@@ -79,6 +79,24 @@ def _headline_stats(f: Fundamentals) -> str:
     return "  ·  ".join(bits)
 
 
+def _risk_line(pf) -> str:
+    """Compact price-risk strip: momentum · volatility · beta · drawdown · liq."""
+    if pf is None or getattr(pf, "error", None) is not None:
+        return ""
+    bits: list[str] = []
+    if pf.momentum is not None:
+        bits.append(f"{pf.momentum * 100:+.0f}% 12-mo")
+    if pf.volatility is not None:
+        bits.append(f"{pf.volatility * 100:.0f}% vol")
+    if pf.beta is not None:
+        bits.append(f"β {pf.beta:.2f}")
+    if pf.max_drawdown is not None:
+        bits.append(f"{pf.max_drawdown * 100:.0f}% maxDD")
+    if pf.avg_dollar_volume is not None:
+        bits.append(f"{_money(pf.avg_dollar_volume)}/day")
+    return "  ·  ".join(bits)
+
+
 class ReportBuilder:
     def __init__(self, top_n: int = 10) -> None:
         self.top_n = top_n
@@ -135,6 +153,9 @@ class ReportBuilder:
                 headline = _headline_stats(c.fundamentals)
                 if headline:
                     lines.append(f"   {headline}")
+            risk = _risk_line(c.factors)
+            if risk:
+                lines.append(f"   Risk: {risk}")
             lines.append(f"   {c.rationale}")
             if c.supporting_signals:
                 lines.append("   + " + "; ".join(c.supporting_signals))
@@ -210,6 +231,12 @@ class ReportBuilder:
                         "<p style=\"margin:2px 0 8px;color:#374151;font-size:13px;"
                         f"font-weight:600;\">{esc(headline)}</p>"
                     )
+            risk = _risk_line(c.factors)
+            if risk:
+                parts.append(
+                    "<p style=\"margin:0 0 8px;color:#6b7280;font-size:12px;\">"
+                    f"Risk &amp; momentum: {esc(risk)}</p>"
+                )
             parts.append(f"<p style=\"margin:8px 0;\">{esc(c.rationale)}</p>")
 
             if c.supporting_signals:
