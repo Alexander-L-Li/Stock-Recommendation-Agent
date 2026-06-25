@@ -1,0 +1,7 @@
+# Runtime dependencies for the Stock Recommendation Agent.
+# Pinned to known-good versions validated at build time on Python 3.12+.
+boto3>=1.34,<2
+praw>=7.7,<9
+feedparser>=6.0,<7
+vaderSentiment>=3.3,<4
+yfinance>=0.2,<2

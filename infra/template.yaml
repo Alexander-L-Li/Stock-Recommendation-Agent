@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Daily long-term stock recommendation agent. Lambda on a daily EventBridge
+  schedule, single-table DynamoDB store, SES email, and a CloudWatch error
+  alarm wired to SNS. Designed to stay within AWS free tier for a once-daily job.
+
+Parameters:
+  SenderEmail:
+    Type: String
+    Description: SES-verified sender address.
+  RecipientEmails:
+    Type: String
+    Description: Comma-separated SES-verified recipient address(es).
+  EnableReddit:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable the Reddit collector. Requires approved Reddit API credentials
+      (Responsible Builder Policy). StockTwits is always on.
+  RedditClientId:
+    Type: String
+    Default: ""
+    NoEcho: true
+  RedditClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+  RedditUserAgent:
+    Type: String
+    Default: "stock-agent/0.1 by personal-use"
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 12 * * ? *)"   # 12:00 UTC daily
+    Description: EventBridge schedule for the daily run.
+  AlarmEmail:
+    Type: String
+    Description: Address to receive CloudWatch error-alarm notifications via SNS.
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Runtime: python3.13
+
+Resources:
+  StockAgentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: stock-agent
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: stock-agent-alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  StockAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: stock-agent
+      Handler: stock_agent.lambda_handler.lambda_handler
+      CodeUri: ../build/lambda/
+      Description: Daily stock recommendation agent orchestrator.
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StockAgentTable
+          SENDER_EMAIL: !Ref SenderEmail
+          RECIPIENT_EMAILS: !Ref RecipientEmails
+          ERROR_EMAIL: !Ref SenderEmail
+          ENABLE_STOCKTWITS: "true"
+          STOCKTWITS_SYMBOL_LIMIT: "15"
+          ENABLE_REDDIT: !Ref EnableReddit
+          REDDIT_CLIENT_ID: !Ref RedditClientId
+          REDDIT_CLIENT_SECRET: !Ref RedditClientSecret
+          REDDIT_USER_AGENT: !Ref RedditUserAgent
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StockAgentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Description: Triggers the stock agent once per day.
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: stock-agent-errors
+      AlarmDescription: Stock agent Lambda reported an error on its daily run.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref StockAgentFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  FunctionName:
+    Value: !Ref StockAgentFunction
+  TableName:
+    Value: !Ref StockAgentTable
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
