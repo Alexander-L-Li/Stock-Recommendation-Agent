@@ -370,3 +370,59 @@ def test_holdings_disabled_by_config_skips_section():
     orch.store = FakeStore(holdings=["AAPL"])
     result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
     assert "YOUR HOLDINGS" not in result.report.text_body
+
+
+# --- Short-term evaluator wiring + holdings excluded from top picks ---
+class FakeTechnicalFetcher:
+    """Returns synthetic price series -> TechnicalSignals per ticker."""
+
+    def __init__(self, rates):
+        # rates: {ticker: daily_rate} -> geometric series
+        self._rates = rates
+
+    def fetch_many(self, tickers):
+        from stock_agent.scoring.short_term import compute_technicals
+        out = {}
+        for t in tickers:
+            rate = self._rates.get(t, 0.0005)
+            closes = [100.0 * ((1.0 + rate) ** i) for i in range(260)]
+            out[t] = compute_technicals(t, closes, [5e6] * 260)
+        return out
+
+
+def _build_with_short_term(config, holdings=None, rates=None):
+    from stock_agent.scoring.short_term import ShortTermEvaluator
+    orch = _build(config)
+    orch.store = FakeStore(holdings=holdings or [])
+    orch.technical_fetcher = FakeTechnicalFetcher(rates or {})
+    orch.short_term = ShortTermEvaluator(config)
+    return orch
+
+
+def test_short_term_section_present_in_report():
+    config = Config()
+    # AAPL trends up strongly -> should surface as a short-term pick.
+    orch = _build_with_short_term(config, rates={"AAPL": 0.004, "MEME": -0.004})
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    assert "SHORT-TERM PICKS" in result.report.text_body
+    assert "AAPL" in result.report.text_body
+
+
+def test_short_term_disabled_omits_section():
+    config = Config(enable_short_term=False)
+    orch = _build_with_short_term(config, rates={"AAPL": 0.004})
+    # Even though collaborators are present, the flag gates it off.
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    assert "SHORT-TERM PICKS" not in result.report.text_body
+
+
+def test_holding_excluded_from_top_picks_e2e():
+    config = Config()
+    # AAPL is the strongest name but it's held -> must not appear in top picks.
+    orch = _build_with_short_term(config, holdings=["AAPL"],
+                                  rates={"AAPL": 0.004})
+    result = orch.run(run_date="2026-06-25", send_email=False, persist=False)
+    text = result.report.text_body
+    picks = text[text.find("TOP PICKS"):]
+    assert "AAPL" not in picks               # held -> excluded from top picks
+    assert "YOUR HOLDINGS" in text and "AAPL" in text  # shown as a holding

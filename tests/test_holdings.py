@@ -109,3 +109,51 @@ def test_holdings_and_watchlist_are_independent(store):
     store.add_holding("AAPL")
     assert store.list_watchlist() == ["TSLA"]
     assert store.list_holdings() == ["AAPL"]
+
+
+# ---------------- holdings excluded from the top picks ----------------
+def _picks_region(text: str) -> str:
+    """The slice of the text report at/after the top-picks header."""
+    marker = "TOP PICKS"
+    idx = text.find(marker)
+    return text[idx:] if idx >= 0 else text
+
+
+def test_held_ticker_is_excluded_from_top_picks_text():
+    held = _cand("NVDA", final=95, name="Nvidia")          # would rank #1
+    a = _cand("AAA", final=80, name="Alpha")
+    b = _cand("BBB", final=70, name="Bravo")
+    report = ReportBuilder(top_n=10).build(
+        [held, a, b], run_date="2026-06-25", holdings=[held])
+
+    picks = _picks_region(report.text_body)
+    assert "NVDA" not in picks          # held -> not in the top picks list
+    assert "AAA" in picks and "BBB" in picks
+    # But it still appears in the holdings section above.
+    assert "YOUR HOLDINGS" in report.text_body
+    assert "NVDA" in report.text_body
+
+
+def test_held_ticker_excluded_from_top_picks_html():
+    held = _cand("NVDA", final=95, name="Nvidia")
+    a = _cand("AAA", final=80, name="Alpha")
+    report = ReportBuilder(top_n=10).build(
+        [held, a], run_date="2026-06-25", holdings=[held])
+    h = report.html_body
+    picks_html = h[h.find("Today's top picks"):]
+    assert "AAA" in picks_html
+    assert "NVDA" not in picks_html     # excluded from picks
+    assert "Your holdings" in h         # but present as a holding
+
+
+def test_top_picks_are_renumbered_without_gaps_when_holding_excluded():
+    held = _cand("NVDA", final=95)
+    a = _cand("AAA", final=80)
+    b = _cand("BBB", final=70)
+    report = ReportBuilder(top_n=10).build(
+        [held, a, b], run_date="2026-06-25", holdings=[held])
+    picks = _picks_region(report.text_body)
+    # AAA should be displayed as #1 (no gap from the excluded #1 holding).
+    assert "#1  AAA" in picks
+    assert "#2  BBB" in picks
+

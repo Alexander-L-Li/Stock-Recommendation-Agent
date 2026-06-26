@@ -121,6 +121,11 @@ class Config:
     # --- Report ---
     top_n: int = 10  # number of picks to include in the emailed report
 
+    # --- Short-term evaluator (1-3 month tactical picks) ---
+    # A separate momentum/technical scorer rendered in its own report section.
+    enable_short_term: bool = True
+    short_term_top_n: int = 5  # number of short-term picks to show
+
     # --- Holdings (portfolio tracker) ---
     # When enabled, tickers on the holdings list are always fetched, scored, and
     # rendered in a dedicated "Your Holdings" section of the report regardless of
@@ -183,6 +188,12 @@ class Config:
                 "MIN_FUNDAMENTAL_METRICS", cls.min_fundamental_metrics
             ),
             top_n=_env_int("TOP_N", cls.top_n),
+            enable_short_term=_env_bool(
+                "ENABLE_SHORT_TERM", cls.enable_short_term
+            ),
+            short_term_top_n=_env_int(
+                "SHORT_TERM_TOP_N", cls.short_term_top_n
+            ),
             enable_holdings=_env_bool("ENABLE_HOLDINGS", cls.enable_holdings),
         )
         if not cfg.error_email and cfg.recipient_emails:

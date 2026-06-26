@@ -77,7 +77,8 @@ src/stock_agent/
   extraction/            # ticker_extractor.py (+ tickers_data.py allow/deny lists)
   sentiment/             # base.py (interface + aggregator), vader.py
   fundamentals/          # yfinance_fetcher.py + price_factors.py (risk/momentum)
-  scoring/               # engine.py (70/30 + hype gate + sector-relative + risk tilt)
+  scoring/               # engine.py (long-term 70/30 + hype gate + sector-relative
+                         #   + risk tilt); short_term.py (1-3 mo momentum/technical)
   analysis/              # backtest.py (forward-return attribution vs SPY)
   report/                # builder.py (HTML + plain text), backtest_report.py
   delivery/              # ses_sender.py
@@ -92,7 +93,7 @@ deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pan
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup (email yourself)
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 150 tests, fully mocked (no network/AWS)
+tests/                   # 167 tests, fully mocked (no network/AWS)
 ```
 
 ## Quick start (local)
@@ -171,6 +172,8 @@ runs locally and in Lambda. Key variables:
 | `PRICE_BENCHMARK` | SPY | Benchmark for beta and backtest excess return |
 | `TOP_N` | 10 | Picks in the report |
 | `ENABLE_HOLDINGS` | true | Render a dedicated "Your Holdings" tracker section |
+| `ENABLE_SHORT_TERM` | true | Render the short-term (1-3 mo) momentum/technical picks section |
+| `SHORT_TERM_TOP_N` | 5 | Number of short-term picks to show |
 
 ## Cost
 
@@ -210,6 +213,15 @@ SENDER_EMAIL=you@example.com RECIPIENT_EMAILS=you@example.com \
   rule-based **ADD / HOLD / TRIM / WATCH** signal (`report.builder.holding_signal`)
   with a short reason — regardless of whether they rank in the day's top picks.
   Toggle with `ENABLE_HOLDINGS`. The signal is a transparent cue, not advice.
+  Held tickers are **excluded from the long-term top picks** (they have their own
+  section), so the same name never appears twice.
+- **Short-term picks (1-3 months)** — a separate momentum/technical evaluator
+  (`scoring/short_term.py`) rendered in its own report section. It flips the
+  long-term model's emphasis: momentum (1m/3m returns) 35%, sentiment/news 25%,
+  technical posture (RSI, 52-week-high proximity, volume) 15%, trend
+  (price vs SMA50/SMA200) 15%, earnings momentum 10% — with falling-knife,
+  volatility, and liquidity risk guards. Emits a **STRONG BUY / BUY / WATCH /
+  AVOID** entry signal. Toggle with `ENABLE_SHORT_TERM`.
 
 ## Performance backtesting & track record
 

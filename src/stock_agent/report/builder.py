@@ -176,6 +176,34 @@ _SIGNAL_COLORS = {
     "WATCH": ("#fef9c3", "#854d0e"),  # amber
 }
 
+# Short-term (1-3 mo) entry-signal colors.
+_SHORT_TERM_COLORS = {
+    "STRONG BUY": ("#bbf7d0", "#14532d"),  # deep green
+    "BUY": ("#dcfce7", "#166534"),         # green
+    "WATCH": ("#fef9c3", "#854d0e"),       # amber
+    "AVOID": ("#fee2e2", "#991b1b"),       # red
+}
+
+
+def _tech_line(t) -> str:
+    """Compact technical posture strip for a short-term pick."""
+    if t is None or getattr(t, "error", None) is not None:
+        return ""
+    bits: list[str] = []
+    if t.ret_3m is not None:
+        bits.append(f"{t.ret_3m * 100:+.0f}% 3mo")
+    if t.ret_1m is not None:
+        bits.append(f"{t.ret_1m * 100:+.0f}% 1mo")
+    if t.rsi14 is not None:
+        bits.append(f"RSI {t.rsi14:.0f}")
+    if t.uptrend is True:
+        bits.append("uptrend")
+    elif t.uptrend is False:
+        bits.append("downtrend")
+    if t.pct_from_52w_high is not None:
+        bits.append(f"{t.pct_from_52w_high * 100:.0f}% from 52w high")
+    return "  ·  ".join(bits)
+
 
 class ReportBuilder:
     def __init__(self, top_n: int = 10) -> None:
@@ -185,15 +213,21 @@ class ReportBuilder:
               run_date: Optional[str] = None,
               excluded: Optional[list[ScoredCandidate]] = None,
               stats: Optional[dict] = None,
-              holdings: Optional[list[ScoredCandidate]] = None) -> Report:
+              holdings: Optional[list[ScoredCandidate]] = None,
+              short_term: Optional[list] = None) -> Report:
         run_date = run_date or date.today().isoformat()
-        picks = ranked[: self.top_n]
         holdings = holdings or []
+        short_term = short_term or []
+        # Held names get their own dedicated section, so they are excluded from
+        # the headline top picks to avoid showing the same ticker twice.
+        holding_tickers = {c.ticker for c in holdings}
+        picks = [c for c in ranked
+                 if c.ticker not in holding_tickers][: self.top_n]
         subject = self._subject(picks, run_date)
         text_body = self._text(picks, run_date, excluded or [], stats or {},
-                               holdings)
+                               holdings, short_term)
         html_body = self._html(picks, run_date, excluded or [], stats or {},
-                               holdings)
+                               holdings, short_term)
         return Report(subject=subject, html_body=html_body, text_body=text_body)
 
     def _subject(self, picks: list[ScoredCandidate], run_date: str) -> str:
@@ -239,10 +273,32 @@ class ReportBuilder:
             lines.append("")
         return lines
 
+    def _short_term_text(self, short_term: list) -> list[str]:
+        lines: list[str] = []
+        lines.append("")
+        lines.append("SHORT-TERM PICKS (1–3 MONTHS)")
+        lines.append("-" * 60)
+        lines.append("Momentum/technical-driven tactical ideas — entry signal is "
+                     "a rule-based cue, not advice.")
+        for st in short_term:
+            name = f"  ({st.name})" if getattr(st, "name", None) else ""
+            lines.append(f"[{st.signal}]  {st.ticker}{name}")
+            lines.append(f"   Short-term score {st.score:.0f}/100")
+            tline = _tech_line(getattr(st, "technicals", None))
+            if tline:
+                lines.append(f"   Technicals: {tline}")
+            if st.reasons:
+                lines.append("   + " + "; ".join(st.reasons[:4]))
+            if st.risks:
+                lines.append("   ! " + "; ".join(st.risks[:3]))
+            lines.append("")
+        return lines
+
     # ----------------- plain text -----------------
     def _text(self, picks: list[ScoredCandidate], run_date: str,
               excluded: list[ScoredCandidate], stats: dict,
-              holdings: Optional[list[ScoredCandidate]] = None) -> str:
+              holdings: Optional[list[ScoredCandidate]] = None,
+              short_term: Optional[list] = None) -> str:
         lines: list[str] = []
         lines.append(f"DAILY STOCK RECOMMENDATION REPORT — {run_date}")
         lines.append("=" * 60)
@@ -265,10 +321,10 @@ class ReportBuilder:
         if not picks:
             lines.append("No candidates cleared the data-quality gate today.")
         else:
-            lines.append("TODAY'S TOP PICKS")
+            lines.append("TODAY'S TOP PICKS (long-term)")
             lines.append("-" * 60)
-        for c in picks:
-            lines.append(f"#{c.rank}  {c.ticker}"
+        for i, c in enumerate(picks, start=1):
+            lines.append(f"#{i}  {c.ticker}"
                          + (f"  ({c.fundamentals.name})"
                             if c.fundamentals and c.fundamentals.name else ""))
             lines.append(f"   Score {c.final_score:.0f}/100  "
@@ -297,6 +353,9 @@ class ReportBuilder:
                     lines.append(f"     - {n.title}{src}")
             lines.append("")
 
+        if short_term:
+            lines.extend(self._short_term_text(short_term))
+
         if excluded:
             lines.append("-" * 60)
             lines.append("Excluded (insufficient data / fetch errors): "
@@ -309,7 +368,8 @@ class ReportBuilder:
     # ----------------- HTML -----------------
     def _html(self, picks: list[ScoredCandidate], run_date: str,
               excluded: list[ScoredCandidate], stats: dict,
-              holdings: Optional[list[ScoredCandidate]] = None) -> str:
+              holdings: Optional[list[ScoredCandidate]] = None,
+              short_term: Optional[list] = None) -> str:
         def esc(s) -> str:
             return html.escape(str(s))
 
@@ -341,9 +401,10 @@ class ReportBuilder:
                          "today.</em></p>")
         else:
             parts.append("<h2 style=\"margin:24px 0 4px;border-bottom:2px solid "
-                         "#e5e7eb;padding-bottom:4px;\">Today's top picks</h2>")
+                         "#e5e7eb;padding-bottom:4px;\">Today's top picks "
+                         "(long-term)</h2>")
 
-        for c in picks:
+        for i, c in enumerate(picks, start=1):
             name = (f" — {esc(c.fundamentals.name)}"
                     if c.fundamentals and c.fundamentals.name else "")
             gate_badge = (
@@ -353,7 +414,7 @@ class ReportBuilder:
             parts.append("<div style=\"border:1px solid #e5e7eb;border-radius:8px;"
                          "padding:16px;margin:12px 0;\">")
             parts.append(
-                f"<h2 style=\"margin:0;\">#{c.rank} {esc(c.ticker)}{name}"
+                f"<h2 style=\"margin:0;\">#{i} {esc(c.ticker)}{name}"
                 f"{gate_badge}</h2>"
             )
             parts.append(self._score_bar(c))
@@ -385,6 +446,9 @@ class ReportBuilder:
             if c.news:
                 parts.append(self._news_block(c.news))
             parts.append("</div>")
+
+        if short_term:
+            parts.append(self._short_term_html(short_term))
 
         if excluded:
             names = ", ".join(esc(c.ticker) for c in excluded)
@@ -454,6 +518,52 @@ class ReportBuilder:
                              f"\">Risk &amp; momentum: {esc(risk)}</p>")
             if c.news:
                 parts.append(ReportBuilder._news_block(c.news))
+            parts.append("</div>")
+        return "".join(parts)
+
+    @staticmethod
+    def _short_term_html(short_term: list) -> str:
+        def esc(s) -> str:
+            return html.escape(str(s))
+
+        parts: list[str] = [
+            "<h2 style=\"margin:24px 0 2px;border-bottom:2px solid #e5e7eb;"
+            "padding-bottom:4px;\">Short-term picks (1–3 months)</h2>",
+            "<p style=\"color:#888;font-size:12px;margin:0 0 8px;\">"
+            "Momentum/technical-driven tactical ideas — the entry signal is a "
+            "rule-based cue, not advice.</p>",
+        ]
+        for st in short_term:
+            bg, fg = _SHORT_TERM_COLORS.get(st.signal, _SHORT_TERM_COLORS["WATCH"])
+            name = (f" — {esc(st.name)}" if getattr(st, "name", None) else "")
+            badge = (f"<span style=\"background:{bg};color:{fg};padding:2px 8px;"
+                     f"border-radius:4px;font-size:12px;font-weight:700;"
+                     f"margin-left:8px;\">{esc(st.signal)}</span>")
+            parts.append(
+                "<div style=\"border:1px solid #e5e7eb;border-left:4px solid "
+                f"{fg};border-radius:8px;padding:12px 16px;margin:10px 0;"
+                "background:#fafafa;\">"
+            )
+            parts.append(f"<h3 style=\"margin:0;\">{esc(st.ticker)}{name}{badge}"
+                         "</h3>")
+            parts.append(
+                "<p style=\"margin:6px 0;font-size:14px;\"><strong>Short-term "
+                f"score {st.score:.0f}/100</strong></p>"
+            )
+            tline = _tech_line(getattr(st, "technicals", None))
+            if tline:
+                parts.append("<p style=\"margin:2px 0;color:#6b7280;font-size:12px;"
+                             f"\">Technicals: {esc(tline)}</p>")
+            if st.reasons:
+                items = "".join(f"<li>{esc(r)}</li>" for r in st.reasons[:4])
+                parts.append("<p style=\"margin:4px 0;color:#15803d;font-size:13px;"
+                             f"\"><strong>Why</strong></p><ul style=\"font-size:"
+                             f"13px;margin-top:2px;\">{items}</ul>")
+            if st.risks:
+                items = "".join(f"<li>{esc(r)}</li>" for r in st.risks[:3])
+                parts.append("<p style=\"margin:4px 0;color:#b91c1c;font-size:13px;"
+                             f"\"><strong>Risks</strong></p><ul style=\"font-size:"
+                             f"13px;margin-top:2px;\">{items}</ul>")
             parts.append("</div>")
         return "".join(parts)
 

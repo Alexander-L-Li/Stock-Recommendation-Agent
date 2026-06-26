@@ -59,6 +59,8 @@ class Orchestrator:
         news_provider: Any = None,
         factor_fetcher: Any = None,
         universe_provider: Any = None,
+        technical_fetcher: Any = None,
+        short_term_evaluator: Any = None,
     ) -> None:
         self.config = config
         self.reddit = reddit_collector
@@ -74,6 +76,8 @@ class Orchestrator:
         self.news_provider = news_provider
         self.factor_fetcher = factor_fetcher
         self.universe = universe_provider
+        self.technical_fetcher = technical_fetcher
+        self.short_term = short_term_evaluator
 
     @classmethod
     def build_default(cls, config: Config, store: Any = None) -> "Orchestrator":
@@ -85,6 +89,7 @@ class Orchestrator:
         from .delivery.ses_sender import SesEmailSender
         from .fundamentals.price_factors import PriceFactorFetcher
         from .fundamentals.yfinance_fetcher import FundamentalsFetcher
+        from .scoring.short_term import ShortTermEvaluator, TechnicalFetcher
         from .sentiment.vader import VaderAnalyzer
         from .storage.dynamo import Store
         from .universe import FixedUniverse
@@ -97,6 +102,12 @@ class Orchestrator:
         factor_fetcher = (
             PriceFactorFetcher(benchmark=config.price_benchmark)
             if config.enable_price_factors else None
+        )
+        technical_fetcher = (
+            TechnicalFetcher() if config.enable_short_term else None
+        )
+        short_term_evaluator = (
+            ShortTermEvaluator(config) if config.enable_short_term else None
         )
         universe = FixedUniverse() if config.enable_fixed_universe else None
         return cls(
@@ -114,6 +125,8 @@ class Orchestrator:
             news_provider=YFinanceNewsProvider(),
             factor_fetcher=factor_fetcher,
             universe_provider=universe,
+            technical_fetcher=technical_fetcher,
+            short_term_evaluator=short_term_evaluator,
         )
 
     def run(self, run_date: Optional[str] = None, send_email: bool = True,
@@ -207,6 +220,35 @@ class Orchestrator:
                 shown_tickers.add(c.ticker)
         self._attach_news(shown, articles)
 
+        # 6c. Short-term (1-3 month) evaluator: a separate momentum/technical
+        #     scorer rendered in its own report section. Best-effort; any
+        #     failure leaves short_term empty and never breaks the run. Held
+        #     names are excluded (they have their own holdings section).
+        short_term_picks: list = []
+        if (self.config.enable_short_term and self.short_term is not None
+                and self.technical_fetcher is not None):
+            try:
+                technicals = self.technical_fetcher.fetch_many(candidates)
+                holding_set = set(holdings)
+                scored_st = []
+                for t in candidates:
+                    tech = technicals.get(t)
+                    if tech is None:
+                        continue
+                    st = self.short_term.score_candidate(
+                        t, tech, sentiment.get(t), fundamentals.get(t))
+                    f = fundamentals.get(t)
+                    if f is not None and f.name:
+                        st.name = f.name
+                    scored_st.append(st)
+                scored_st.sort(key=lambda s: s.score, reverse=True)
+                short_term_picks = [
+                    s for s in scored_st
+                    if s.ticker not in holding_set and s.signal != "AVOID"
+                ][: self.config.short_term_top_n]
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Short-term evaluation failed: %s", exc)
+
         # 7. Report
         stats = {
             "candidates": len(candidates),
@@ -217,7 +259,7 @@ class Orchestrator:
         }
         report = self.report_builder.build(
             ranked, run_date=run_date, excluded=excluded, stats=stats,
-            holdings=holdings_cands,
+            holdings=holdings_cands, short_term=short_term_picks,
         )
 
         # 8. Persist history

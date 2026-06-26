@@ -32,7 +32,7 @@ Long-term horizon, no trading, personal use. Tagline in the report:
 - **Local repo:** `~/StockAgent/stock-recommendation-agent`
 - **GitHub:** `https://github.com/Alexander-L-Li/Stock-Recommendation-Agent` (branch `main`)
 - **Language:** Python 3.14, virtualenv at `.venv/`
-- **Tests:** 150, fully mocked (no network/AWS)
+- **Tests:** 167, fully mocked (no network/AWS)
 
 ---
 
@@ -50,6 +50,7 @@ src/stock_agent/
   fundamentals/          # yfinance_fetcher.py (caching, missing-data handling)
                          # price_factors.py  <-- #4 momentum/vol/beta/drawdown/liquidity
   scoring/               # engine.py  <-- 70/30 + hype gate + #3 sector-relative + #4 risk tilt
+                         # short_term.py <-- 1-3 mo momentum/technical evaluator
   analysis/              # backtest.py (forward-return attribution vs SPY)
   report/                # builder.py (HTML + plain text), backtest_report.py
   delivery/              # ses_sender.py
@@ -64,7 +65,7 @@ deploy/build_lambda.sh   # builds the Lambda zip (manylinux wheels for numpy/pan
 deploy/deploy_aws.sh     # one-shot deploy via AWS CLI (no SAM/Docker required)
 docs/SES_SETUP.md        # SES sandbox setup
 docs/DEPLOYMENT.md       # full deploy walkthrough
-tests/                   # 150 tests, fully mocked
+tests/                   # 167 tests, fully mocked
 ```
 
 ---
@@ -240,6 +241,34 @@ Lets the owner track stocks they hold with a dedicated daily report section.
   (neg-momentum AND soft-sentiment) -> TRIM; no fundamentals -> WATCH). Rendered as
   a "Your Holdings" section (text + HTML, colored badge) FIRST, before the day's
   top picks. Toggle: `ENABLE_HOLDINGS`.
+- **Held names are excluded from the long-term top picks** (builder drops
+  holding tickers from `picks` before slicing `top_n`; picks are displayed with
+  an `enumerate` counter so there are no rank gaps). They appear only in the
+  holdings section, never twice.
+
+---
+
+## 8c. Short-term evaluator (scoring/short_term.py)
+
+A **separate** scorer for tactical 1-3 month picks, independent of the long-term
+`ScoringEngine` (different horizon, different model).
+
+- **`compute_technicals(ticker, closes, volumes) -> TechnicalSignals`** — pure
+  Python (no numpy/pandas): 1m/3m/6m returns, SMA50/SMA200, RSI(14), 52-week-high
+  proximity, 20-day annualized vol, volume ratio, avg dollar volume.
+- **`TechnicalFetcher`** — wraps `price_factors._default_series_factory` (same
+  yfinance loader), TTL-cached, `fetch_many -> dict[str, TechnicalSignals]`.
+- **`ShortTermEvaluator.score_candidate(ticker, technicals, sentiment,
+  fundamentals) -> ShortTermScore`** — blend: momentum 35% / sentiment 25% /
+  posture 15% / trend 15% / earnings 10% (renormalized over present components).
+  Risk guards: falling-knife (-15 if 1m <= -10% AND below SMA50), volatility
+  penalty (up to ~12 pts), liquidity gate (caps at 50 below `min_dollar_volume`).
+  Signal: **STRONG BUY / BUY / WATCH / AVOID** (>=75 / >=60 / >=45 / else).
+- **Orchestrator** (run step 6c): when `enable_short_term`, fetches technicals
+  for the candidate set, scores each, drops holdings + AVOID, sorts desc, takes
+  `short_term_top_n`, sets `.name`, passes `short_term=` to the report. Rendered
+  in its own "Short-term picks (1-3 months)" section. Best-effort (try/except).
+  Toggles: `ENABLE_SHORT_TERM`, `SHORT_TERM_TOP_N`.
 
 ---
 
@@ -268,6 +297,8 @@ Lets the owner track stocks they hold with a dedicated daily report section.
 | `PRICE_BENCHMARK` | SPY | Beta + backtest benchmark |
 | `TOP_N` | 10 | Picks in the report |
 | `ENABLE_HOLDINGS` | true | Render the "Your Holdings" portfolio-tracker section |
+| `ENABLE_SHORT_TERM` | true | Render the short-term (1-3 mo) momentum/technical section |
+| `SHORT_TERM_TOP_N` | 5 | Number of short-term picks to show |
 
 All new flags default to enabled in code, so the deployed Lambda picked them up
 without any env changes.
@@ -279,7 +310,7 @@ without any env changes.
 ```bash
 cd ~/StockAgent/stock-recommendation-agent
 
-# Run the full suite (150 tests). PYTHONPATH=src needed for ad-hoc -c imports.
+# Run the full suite (167 tests). PYTHONPATH=src needed for ad-hoc -c imports.
 .venv/bin/python -m pytest -p no:cacheprovider --color=no
 
 # Run a single file
@@ -406,6 +437,16 @@ aws dynamodb query --table-name stock-agent --region us-east-1 \
    repeated same-day manual test invocations. **+15 tests (150 total)**. Verified
    live: NVDA->ADD, AAPL/KO->HOLD, INTC->TRIM render with real data; re-run kept
    the partition at exactly 40 picks (idempotency holds).
+
+5. **Short-term evaluator + holdings excluded from top picks** (latest) — new
+   `scoring/short_term.py` (TechnicalSignals/compute_technicals, TechnicalFetcher,
+   ShortTermEvaluator -> STRONG BUY/BUY/WATCH/AVOID), rendered in its own
+   "Short-term picks (1-3 months)" report section (text + HTML). Held tickers are
+   now excluded from the long-term top picks (shown only in the holdings section);
+   picks display with an `enumerate` counter (no rank gaps). Added MU/AMZN/META to
+   live holdings (17 total). **+17 tests (167 total)**. Verified live: short-term
+   section renders (MRNA STRONG BUY, C/AMD/INTC BUY), and zero holdings leak into
+   the top picks.
 
 ---
 
